@@ -20,6 +20,9 @@ node_modules/
 .cache/
 tmp/
 
+.opencode/
 # 本地音乐库和索引
 /docs/*/.music/
 /skills/music-download/data/library.sqlite3*
+/skills/music-download/data/batches.sqlite3*
+/skills/kugou-playlist/data/

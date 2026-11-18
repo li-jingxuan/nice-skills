@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""通过夸克网盘下载单曲并入库，为音频匹配同名 LRC。"""
+"""通过夸克或百度网盘下载歌曲并入库，为音频匹配同名 LRC。"""
 
 import argparse
 import hashlib
@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import unicodedata
 from contextlib import closing
@@ -21,6 +22,8 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import lyric_sources
+import music_batch
+from music_baidu import Baidu, BaiduError, FILE_ID as BAIDU_FILE_ID
 
 
 # 官网地址：https://so.liumingye.cn/
@@ -35,6 +38,7 @@ FORMATS = {
 CODEC_MATCH_FORMATS = {"flac", "mp3", "aac", "ape", "opus"}
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 QUARK_FID_PATTERN = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_-]*|~[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+)")
+QUARK_DOWNLOAD_LIMIT = re.compile(r"\bdownload file size limit\s*\[\s*([1-9][0-9]{0,19})\s*\]", re.IGNORECASE)
 VERSION_SUFFIX = re.compile(r"(?:\s*[(（\[【]([^()（）\[\]【】]+)[)）\]】]| - ([^-]+))$")
 VERSION_LABEL = re.compile(
     r"\b(live|acoustic|instrumental|remaster(?:ed)?|remix|demo|cover|radio edit)\b"
@@ -42,6 +46,39 @@ VERSION_LABEL = re.compile(
 )
 LRC_TIME = re.compile(r"\[(\d{1,3}):([0-5]\d)(?:[.:](\d{1,3}))?\]")
 LRC_OFFSET = re.compile(r"^\[offset:\s*([+-]?\d+)\]", re.IGNORECASE | re.MULTILINE)
+HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+KANA_OR_HANGUL = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]")
+LRC_CREDIT = re.compile(r"^(?:作[词詞曲]|[词詞曲]|[编編]曲|歌手|演唱|[录錄]音|混音|製作|制作)[\s:：/]|"
+                        r"^(?:未经|未經|版权所有|版權所有)")
+# 歌词中常见的简繁特征字。两种字形都常用的字（例如「后」「里」）不参与判断。
+SIMPLIFIED_MARKERS = frozenset(
+    "万与东丝丢两个为丽么义乐习乡书买乱争云亲仅从们优会伤伞体偿儿兰关兴养兽冲决冻净凉凤创删"
+    "剧劝办务动劳势华协单卖卫厅历压厌叹听员呜响哟唤团园围国图圆圣场坏块坚坠墙壮声处备头夺"
+    "奖妈妇娇孙学宁宝实宠宽对寻导尘尝层岁岛币帅师帐帘带帮广庆应废开异弃张弯弹归当录彻径忆忧怀"
+    "态怜总恋恼悬惊惧惯愤戏战户执扩扫扬护报拟择挣挥损摇撑敌数断无旧时显晓晕暂术机杀杂权条来"
+    "枫枪栏树样桥梦楼欢残毕气汉汤沟没沧泪洁浅浊测济浓润涨涩渊湾湿满滨滩灭灯灵灾灿炉点烂烛"
+    "烦烧热爱爷牵犹狮猎独猫献环现电画疗疯监盘睁矿码砖确礼离种积称稳穷窝竞笔笼简签篮类粮紧"
+    "纠红约级纪纯纸纹线练细织终绊经绑结绕绘给绝统绣继绪续维绵绿缓编缘缝缠缩网联聪肤胆胶脉"
+    "脑脸腾艰艺节药莲获萤营蓝虑虽蛮补装裤见观规视览觉触订计认讨让议讯记讲许论设访诀证识诉"
+    "词译试诗诚话该语误说请诺读谁调谎谜谢谣谦谱负财败账货质贫贵贺资赏赛赞赠赵赶跃踪躯车轨"
+    "转轮软轻载较辆输辞边达迁过迈运还这进远违连迟选递遗遥邮邻酿释针钟钢钱铁铃铜银铺链锁锋"
+    "锐错锦镇镜长门闪闭闯间闷闹闻阅队阳阴阵际陆陈险随隐难雾顶顺顾顿颂预领频颗题颜额颠颤风"
+    "飘飞饥饭饮饱饼馆马驰驱驶骂骄验骑骗骤鱼鲜鸟鸡鸣鸦鹊鹤鹰麦齐齿龄龙龟发"
+)
+TRADITIONAL_MARKERS = frozenset(
+    "萬與東絲丟兩個為麗麼義樂習鄉書買亂爭雲親僅從們優會傷傘體償兒蘭關興養獸沖決凍淨涼鳳創刪"
+    "劇勸辦務動勞勢華協單賣衛廳歷壓厭嘆聽員嗚響喲喚團園圍國圖圓聖場壞塊堅墜牆壯聲處備頭奪"
+    "獎媽婦嬌孫學寧寶實寵寬對尋導塵嘗層歲島幣帥師帳簾帶幫廣慶應廢開異棄張彎彈歸當錄徹徑憶憂懷"
+    "態憐總戀惱懸驚懼慣憤戲戰戶執擴掃揚護報擬擇掙揮損搖撐敵數斷無舊時顯曉暈暫術機殺雜權條來"
+    "楓槍欄樹樣橋夢樓歡殘畢氣漢湯溝沒滄淚潔淺濁測濟濃潤漲澀淵灣濕滿濱灘滅燈靈災燦爐點爛燭"
+    "煩燒熱愛爺牽猶獅獵獨貓獻環現電畫療瘋監盤睜礦碼磚確禮離種積稱穩窮窩競筆籠簡簽籃類糧緊"
+    "糾紅約級紀純紙紋線練細織終絆經綁結繞繪給絕統繡繼緒續維綿綠緩編緣縫纏縮網聯聰膚膽膠脈"
+    "腦臉騰艱藝節藥蓮獲螢營藍慮雖蠻補裝褲見觀規視覽覺觸訂計認討讓議訊記講許論設訪訣證識訴"
+    "詞譯試詩誠話該語誤說請諾讀誰調謊謎謝謠謙譜負財敗賬貨質貧貴賀資賞賽讚贈趙趕躍蹤軀車軌"
+    "轉輪軟輕載較輛輸辭邊達遷過邁運還這進遠違連遲選遞遺遙郵鄰釀釋針鐘鋼錢鐵鈴銅銀鋪鏈鎖鋒"
+    "銳錯錦鎮鏡長門閃閉闖間悶鬧聞閱隊陽陰陣際陸陳險隨隱難霧頂順顧頓頌預領頻顆題顏額顛顫風"
+    "飄飛飢飯飲飽餅館馬馳驅駛罵驕驗騎騙驟魚鮮鳥雞鳴鴉鵲鶴鷹麥齊齒齡龍龜臺裏裡發髮後隻"
+)
 
 INDEX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS indexed_roots (root TEXT PRIMARY KEY);
@@ -86,6 +123,12 @@ class SkillError(Exception):
         self.required_setting = required_setting
 
 
+class DownloadSizeLimit(SkillError):
+    def __init__(self, message, limit_bytes):
+        super().__init__(message)
+        self.limit_bytes = limit_bytes
+
+
 def require_id(value, label, *, pattern=QUARK_FID_PATTERN):
     # 夸克新版返回带签名的 FID。下歌吧调用传入单独的 ID 规则。
     if not isinstance(value, str) or not pattern.fullmatch(value):
@@ -93,17 +136,24 @@ def require_id(value, label, *, pattern=QUARK_FID_PATTERN):
     return value
 
 
-def quark_url(value):
+def share_provider(value):
     if not isinstance(value, str):
-        return False
+        return None
     try:
         url = urlsplit(value)
     except ValueError:
-        return False
-    return (
-        url.scheme == "https" and url.netloc.lower() == "pan.quark.cn"
-        and bool(re.fullmatch(r"/s/[A-Za-z0-9]+/?", url.path))
-    )
+        return None
+    if url.scheme == "https":
+        if url.netloc.lower() == "pan.quark.cn" and re.fullmatch(r"/s/[A-Za-z0-9]+/?", url.path):
+            return "quark"
+        if url.netloc.lower() == "pan.baidu.com" and re.fullmatch(r"/s/[A-Za-z0-9_-]+/?", url.path):
+            return "baidu"
+    return None
+
+
+def label_format(label):
+    formats = {part for part in re.findall(r"[a-z0-9]+", label.lower()) if part in FORMATS}
+    return next(iter(formats)) if len(formats) == 1 else None
 
 
 def source_json(url):
@@ -137,9 +187,10 @@ def search_tracks(args):
     if not isinstance(results, list):
         raise SkillError("下歌吧的搜索结果缺少歌曲列表。")
     tracks = []
-    # 搜索只保留有夸克来源的条目，实际可用格式要在详情和分享文件中确认。
+    # 标签只提示来源和可能的格式，文件格式由分享列表确认。
     for track in results:
-        labels = [label for label in track.get("quality") or [] if isinstance(label, str) and "夸克" in label]
+        labels = [label for label in track.get("quality") or []
+                  if isinstance(label, str) and any(name in label for name in ("夸克", "百度"))]
         if labels:
             tracks.append({**track_fields(track), "quality": labels})
     return {
@@ -156,12 +207,10 @@ def track_detail(args):
     downloads = []
     for item in track.get("downloads") or []:
         url = item.get("url")
-        if not quark_url(url):
+        if not share_provider(url):
             continue
         label = item.get("quality") or ""
-        # 「夸克网盘」这类标签没有格式信息，留给分享列表确认。
-        formats = [part for part in re.findall(r"[a-z0-9]+", label.lower()) if part in FORMATS]
-        option = {"url": url, "quality": label, "format": formats[0] if len(formats) == 1 else None}
+        option = {"url": url, "quality": label, "format": label_format(label)}
         if option not in downloads:
             downloads.append(option)
     return {**track_fields(track), "downloads": downloads}
@@ -201,11 +250,19 @@ class Quark:
             elif record.get("type") == "artifact":
                 artifact_path = (record.get("data") or {}).get("file_path")
         if result.returncode or final.get("code") != 0:
+            if getattr(self, "capture_status", False):
+                # 批量队列用错误码判断暂停条件，用转存任务的终态判断是否可以补交。
+                self.context["quark_code"] = final.get("code")
+                data = final.get("data")
+                self.context["quark_task_status"] = data.get("status") if isinstance(data, dict) else None
             if final.get("code") == -104:
                 raise SkillError("夸克 CLI 无法识别当前运行环境。请在夸克支持的 OpenClaw 或 Codex 环境中运行。")
             # 分享链接可能带提取码，错误提示只保留 CLI 的其他内容。
             message = str(final.get("msg") or "夸克 CLI 未返回成功结果。")
+            limit = QUARK_DOWNLOAD_LIMIT.search(message) if command == "download" else None
             message = re.sub(r"https?://[^\s]+", "[链接]", message)
+            if limit:
+                raise DownloadSizeLimit(message[:300], int(limit[1]))
             raise SkillError(message[:300])
         data = final.get("data")
         if not isinstance(data, dict):
@@ -218,7 +275,7 @@ class Quark:
 
 
 def share_url(args):
-    if not quark_url(args.url):
+    if share_provider(args.url) != "quark":
         raise SkillError("请提供有效的 HTTPS 夸克网盘分享链接。")
     if args.passcode:
         # 使用 URL 携带提取码，让夸克 CLI 的各分页路径都能解析。
@@ -248,6 +305,25 @@ def share_page(quark, args):
                 "format": audio_format if kind == "1" else None,
             })
     return {"files": files, "next_page": args.page + 1 if len(entries) >= SHARE_PAGE_SIZE else None}
+
+
+def share_client(args, context):
+    provider = share_provider(args.url)
+    if provider == "baidu":
+        if args.folder_fid != "0" or getattr(args, "staging_fid", None):
+            raise SkillError("百度网盘子目录请用 --source-dir，续接暂存目录请用 --staging-dir。")
+        return Baidu(context)
+    if provider == "quark":
+        if getattr(args, "source_dir", None) or getattr(args, "staging_dir", None):
+            raise SkillError("夸克子目录请用 --folder-fid，续接暂存目录请用 --staging-fid。")
+        return Quark(context)
+    raise SkillError("请提供有效的 HTTPS 夸克或百度网盘分享链接。")
+
+
+def browse_share(client, args):
+    if isinstance(client, Baidu):
+        return client.share_page(args, FORMATS)
+    return share_page(client, args)
 
 
 def library_root():
@@ -293,9 +369,13 @@ def song_version(title, version=None):
     return title, version
 
 
-def open_index():
+def index_path():
     override = os.environ.get("MUSIC_LIBRARY_DB")
-    path = Path(override).expanduser() if override else Path(__file__).resolve().parents[1] / "data/library.sqlite3"
+    return Path(override).expanduser() if override else Path(__file__).resolve().parents[1] / "data/library.sqlite3"
+
+
+def open_index():
+    path = index_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     database = sqlite3.connect(path, timeout=30)
     try:
@@ -373,7 +453,7 @@ def refresh_index(database, root, *, first_lookup=False):
 
 def lookup_library(args):
     root = library_root()
-    title, _ = song_version(args.title)
+    title, _ = song_version(args.title, getattr(args, "version", None))
     if not title:
         raise SkillError("请提供歌名。")
     query = "SELECT * FROM library_tracks WHERE root = ? AND title_key = ?"
@@ -416,7 +496,7 @@ def library_filename(args):
     return name
 
 
-def locate_saved_file(quark, folder_fid, selected, local_dir):
+def locate_saved_file(quark, folder_fid, selected, local_dir, *, allow_empty=False):
     """在已确认的暂存目录内按原文件名和字节数找到转存后的 FID。"""
     name = selected["filename"]
     quark.context["stage"] = "locate"
@@ -436,18 +516,22 @@ def locate_saved_file(quark, folder_fid, selected, local_dir):
     if not artifact:
         raise SkillError("夸克未返回完整文件列表，暂时无法定位转存文件。")
     with Path(artifact).open(encoding="utf-8") as lines:
+        entries = list(map(json.loads, lines))
         matches = [
-            file for file in map(json.loads, lines)
+            file for file in entries
             if (browse or str(file.get("parent_fid")) == folder_fid)
             and str(file.get("file_type", "1")) == "1"
             and file.get("filename") == name and file.get("size") == selected["size"]
         ]
+    # 只有按目录查到完整的空列表，才可在原暂存目录内补做转存。
+    if allow_empty and browse and not entries:
+        return None
     if len(matches) != 1:
         raise SkillError("尚未在本次暂存目录唯一定位到转存文件，请检查夸克网盘中的转存结果。")
     return require_id(matches[0].get("fid"), "转存文件 ID")
 
 
-def save_to_quark(quark, args, selected):
+def create_staging_folder(quark, args, selected):
     # 每次使用独立的网盘暂存目录，同名的历史文件和其他并发请求不参与匹配。
     folder_name = f"music-download-{uuid4().hex[:16]}"
     parent = os.environ.get("MUSIC_QUARK_STAGING_PARENT_FID")
@@ -455,23 +539,56 @@ def save_to_quark(quark, args, selected):
     folder, _ = quark.run("create-folder", "--dir-path", folder_name, *folder_options, stage="create_staging")
     quark.context["quark_staging"] = {"name": folder_name, "path": folder.get("full_path"), "fid": folder.get("fid")}
     folder_id = require_id(folder.get("fid"), "网盘暂存目录 ID")
-    saved, _ = quark.run(
-        "saveas", "--url", share_url(args), "--fid-list", selected["fid"],
-        "--to-pdir-fid", folder_id, timeout=960,
-    )
-    saved_folder = (saved.get("save_as") or {}).get("to_pdir_fid")
-    if saved_folder is not None and str(saved_folder) != folder_id:
-        raise SkillError("夸克返回的转存目录与本次暂存目录不一致。")
+    if checkpoint := getattr(args, "_checkpoint", None):
+        quark.context["quark_staging"].update(filename=selected["filename"], size=selected["size"])
+        checkpoint(staging={**quark.context["quark_staging"], "saved": False})
     return folder_id
 
 
+def save_share_file(quark, args, selected, folder_id):
+    checkpoint = getattr(args, "_checkpoint", None)
+    url = share_url(args)
+    if checkpoint:
+        # CLI 提交转存后会轮询。提前记下可能已提交，进程中断时先查询原目录。
+        checkpoint(staging={**quark.context["quark_staging"], "submitted": True})
+    try:
+        saved, _ = quark.run("saveas", "--url", url, "--fid-list", selected["fid"],
+                             "--to-pdir-fid", folder_id, timeout=960)
+    except SkillError:
+        # 超时或未知结果可能仍在后台转存。只有明确未提交或任务终态失败才允许重新提交。
+        if checkpoint and (quark.context.get("quark_code") in {-103, -104, -1106, -1107, 32003, 41035, 41014}
+                           or quark.context.get("quark_task_status") == 3):
+            checkpoint(staging={**quark.context["quark_staging"], "submitted": False})
+        raise
+    saved_folder = (saved.get("save_as") or {}).get("to_pdir_fid")
+    if saved_folder is not None and str(saved_folder) != folder_id:
+        raise SkillError("夸克返回的转存目录与本次暂存目录不一致。")
+    if checkpoint:
+        checkpoint(staging={**quark.context["quark_staging"], "saved": True})
+
+
 def transfer(quark, args, selected, local_dir):
-    if args.staging_fid:
-        folder_id = require_id(args.staging_fid, "网盘暂存目录 ID")
-        quark.context["quark_staging"] = {"fid": folder_id}
+    """优先从网盘恢复点下载。需要补做转存时，先核对原暂存目录。"""
+    staging = getattr(args, "_staging", None) or {}
+    if staging.get("file_fid"):
+        quark.context["quark_staging"] = staging
+        file_fid = require_id(staging["file_fid"], "转存文件 ID")
     else:
-        folder_id = save_to_quark(quark, args, selected)
-    file_fid = locate_saved_file(quark, folder_id, selected, local_dir)
+        file_fid = None
+        if args.staging_fid:
+            folder_id = require_id(args.staging_fid, "网盘暂存目录 ID")
+            quark.context["quark_staging"] = staging or {"fid": folder_id}
+            # 批量恢复时，确认此前未提交且目录为空，才在原目录补做转存。
+            allow_empty = bool(staging) and not (staging.get("saved") or staging.get("submitted"))
+            file_fid = locate_saved_file(quark, folder_id, selected, local_dir, allow_empty=allow_empty)
+        else:
+            folder_id = create_staging_folder(quark, args, selected)
+        if file_fid is None:
+            save_share_file(quark, args, selected, folder_id)
+            file_fid = locate_saved_file(quark, folder_id, selected, local_dir)
+    if checkpoint := getattr(args, "_checkpoint", None):
+        checkpoint(staging={**quark.context["quark_staging"], "saved": True, "file_fid": file_fid,
+                            "size": selected["size"]})
     downloaded, _ = quark.run(
         "download", "--fid", file_fid, "--output-dir", str(local_dir), timeout=900,
     )
@@ -588,9 +705,31 @@ def lrc_cues(text, duration):
     return tuple(sorted(cues))
 
 
-def find_lyrics(title, artist, album, version, duration, source=None, lyric_id=None):
+def chinese_lyric_script(cues):
+    # 只判断时间轴正文。去掉署名和版权行，避免把带中文制作信息的英文歌判成中文。
+    body = "\n".join({line for _, line in cues if not LRC_CREDIT.match(line)})
+    han = HAN.findall(body)
+    if (len(han) < 2 or KANA_OR_HANGUL.search(body)
+            or len(han) <= sum(character.isalpha() for character in body) - len(han)):
+        return None
+    characters = set(han)
+    simplified = not SIMPLIFIED_MARKERS.isdisjoint(characters)
+    traditional = not TRADITIONAL_MARKERS.isdisjoint(characters)
+    if simplified != traditional:
+        return "zh-Hans" if simplified else "zh-Hant"
+    return "zh"
+
+
+def lyric_choices(matches):
+    if len(matches) == 1:
+        return matches[0]
+    return {"status": "needs_review", "candidates": [summary for summary, _ in matches]}, None
+
+
+def find_lyrics(title, artist, album, version, duration, source=None, lyric_id=None, *, prefer_simplified=True):
     pending = []
     unavailable = []
+    chinese_fallback = None
     for name in (source,) if source else lyric_sources.SOURCES:
         try:
             ranked = {}
@@ -601,6 +740,9 @@ def find_lyrics(title, artist, album, version, duration, source=None, lyric_id=N
                 if rank is not None:
                     ranked.setdefault(rank, []).append(row)
             for rank, rows in sorted(ranked.items()):
+                # 简体优先只在可信度相当的候选中生效，不能为字形降低匹配标准。
+                if chinese_fallback is not None and rank > chinese_fallback[0]:
+                    break
                 matches = {}
                 for row in rows:
                     text = lyric_sources.fetch(name, row)
@@ -611,18 +753,37 @@ def find_lyrics(title, artist, album, version, duration, source=None, lyric_id=N
                     if cues:
                         summary = {key: row[key] for key in ("id", "title", "artist", "album", "duration")}
                         summary.update(source=name, timestamps=len(cues))
+                        script = chinese_lyric_script(cues)
+                        if script:
+                            summary["language"] = script
                         matches.setdefault(cues, (summary, text))
-                if len(matches) == 1 and (lyric_id or not rank[0]):
-                    summary, text = next(iter(matches.values()))
-                    return summary, text
-                if matches:
-                    pending.extend(summary for summary, _ in matches.values())
-                    # 同一个可信等级有不同时间轴时，交给用户选择。
-                    if not rank[0]:
-                        return {"status": "needs_review", "candidates": pending}, None
+                if not matches:
+                    continue
+                choices = list(matches.values())
+                if lyric_id:
+                    return lyric_choices(choices)
+                if rank[0]:
+                    pending.extend(summary for summary, _ in choices)
+                    continue
+                if not prefer_simplified:
+                    return lyric_choices(choices)
+                scripts = {summary.get("language") for summary, _ in choices}
+                if None in scripts:
+                    if chinese_fallback is None:
+                        return lyric_choices(choices)
+                    break
+                simplified = [choice for choice in choices if choice[0]["language"] == "zh-Hans"]
+                if simplified:
+                    return lyric_choices(simplified)
+                # 先留存当前中文歌词，继续查其他来源是否有同等可信度的简体版。
+                if chinese_fallback is None:
+                    chinese_fallback = (rank, choices)
+                break
         except (OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError):
             # 超时、限流和响应结构变化时继续查下一家。响应内容和下载参数留在脚本内部。
             unavailable.append(name)
+    if chinese_fallback is not None:
+        return lyric_choices(chinese_fallback[1])
     if pending:
         return {"status": "needs_review", "candidates": pending}, None
     if unavailable:
@@ -644,7 +805,9 @@ def save_lyrics(path, args, *, audio_info=None, source=None, lyric_id=None):
             audio_info = validate_audio(path, path.suffix.lower()[1:], original.st_size, ffprobe)
         _, duration, tags = audio_info
         metadata = lyric_metadata(path, args, tags)
-        match, text = find_lyrics(*metadata, duration, source, lyric_id)
+        language = song_key(tags.get("language", "")).replace("_", "-").split("-", 1)[0]
+        explicit_english = language in {"en", "eng", "english", "英语", "英文"}
+        match, text = find_lyrics(*metadata, duration, source, lyric_id, prefer_simplified=not explicit_english)
         if text is None:
             return {**result, **match}
         # 同目录暂存，再一次性发布，避免覆盖已有歌词，也避免播放器读到半个文件。
@@ -698,32 +861,63 @@ def publish(staged, destination):
 
 
 def download(args, context):
+    try:
+        return download_file(args, context)
+    except DownloadSizeLimit as error:
+        mp3_fid = getattr(args, "mp3_file_fid", None)
+        if args.format != "flac" or not mp3_fid:
+            raise
+        # 新文件需要独立转存。保留 FLAC 的暂存信息，避免误用其目录续接 MP3。
+        fallback = context["fallback"] = {"from_format": "flac", "to_format": "mp3", "limit_bytes": error.limit_bytes}
+        if "quark_staging" in context:
+            fallback["quark_staging"] = context.pop("quark_staging")
+        mp3_args = argparse.Namespace(**{**vars(args), "format": "mp3", "file_fid": mp3_fid, "staging_fid": None})
+        return download_file(mp3_args, context, limit_bytes=error.limit_bytes)
+
+
+def download_file(args, context, *, limit_bytes=None):
     context["stage"] = "destination"
     target = destination_dir(args.directory)
     context["stage"] = "configuration"
-    file_fid = require_id(args.file_fid, "分享文件 ID")
+    baidu = share_provider(args.url) == "baidu"
+    file_fid = require_id(args.file_fid, "分享文件 ID", pattern=BAIDU_FILE_ID if baidu else QUARK_FID_PATTERN)
     filename = library_filename(args)
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise SkillError("校验音频需要 ffprobe。")
-    quark = Quark(context)
-    # 复查聊天里选中的 FID 和格式，确保转存前分享内容仍与选择一致。
-    candidates = share_page(quark, args)["files"]
-    selected = next((file for file in candidates if file["fid"] == file_fid), None)
+    checkpoint = getattr(args, "_checkpoint", None)
+    client = share_client(args, context)
+    if not baidu:
+        client.capture_status = bool(checkpoint)
+    saved = getattr(args, "_staging", None) or {}
+    if saved.get("file_fid") or (saved.get("filename") and (saved.get("saved") or saved.get("submitted"))):
+        # 网盘副本已定位时直接用其 FID，否则用已记录的文件名和大小查询暂存目录。
+        # 这两种恢复方式都可以在原分享失效后继续。
+        selected = {"format": args.format, "size": saved["size"], "filename": saved.get("filename"), "fid": file_fid}
+    else:
+        # 复查聊天里选中的 FID 和格式，确保转存前分享内容仍与选择一致。
+        candidates = browse_share(client, args)["files"]
+        selected = next((file for file in candidates if file["fid"] == file_fid), None)
     if not selected or selected["format"] != args.format:
         raise SkillError(f"选中文件不在指定分享页，或格式不是 {args.format.upper()}。")
     if not isinstance(selected["size"], int) or selected["size"] <= 0:
-        raise SkillError("夸克分享缺少有效的文件大小，无法核对下载和转存文件。")
+        raise SkillError("网盘分享缺少有效的文件大小，无法核对下载和转存文件。")
+    if not baidu and limit_bytes is not None and selected["size"] > limit_bytes:
+        raise DownloadSizeLimit(f"候选 {args.format.upper()} 超过夸克的单文件下载上限。", limit_bytes)
 
     context["stage"] = "destination"
     target.mkdir(parents=True, exist_ok=True)
     destination = target / filename
     staged = target / f".music-download-{uuid4().hex}.part"
+    if checkpoint:
+        # 创建文件前记下路径，进程异常退出后可以处理残留的暂存文件。
+        checkpoint(part=str(staged))
     # 先检验目录是否可写。使用 .part 后缀，让播放器只在发布后看到成品。
     output = staged.open("xb")
     try:
         with output, tempfile.TemporaryDirectory(prefix="music-download-") as folder:
-            source = transfer(quark, args, selected, Path(folder).resolve())
+            local_dir = Path(folder).resolve()
+            source = client.transfer(args, selected, local_dir) if baidu else transfer(client, args, selected, local_dir)
             context["stage"] = "validate_audio"
             audio_info = validate_audio(source, args.format, selected["size"], ffprobe)
             context["stage"] = "publish"
@@ -731,9 +925,16 @@ def download(args, context):
                 shutil.copyfileobj(stream, output)
             output.flush()
             os.fsync(output.fileno())
+        if checkpoint:
+            # 音频校验及写盘完成后记录哈希，续跑时据此确认暂存或已发布音频的内容。
+            checkpoint(publish={"path": str(destination), "size": audio_info[0], "sha256": sha256(staged).hex()})
         status = publish(staged, destination)
     finally:
         staged.unlink(missing_ok=True)
+    return finish_download(args, destination, audio_info, status=status)
+
+
+def finish_download(args, destination, audio_info, *, status):
     result = {"status": status, "path": str(destination), "format": args.format, "size": audio_info[0]}
     try:
         root = library_root()
@@ -766,14 +967,15 @@ def parse_args():
     lookup.add_argument("--title", required=True)
     lookup.add_argument("--artist", default="")
     commands.add_parser("reindex", help="扫描整个 NAS 音乐库并刷新本地索引")
-    commands.add_parser("detail", help="查询歌曲的夸克分享链接").add_argument("--id", required=True)
+    commands.add_parser("detail", help="查询歌曲的夸克和百度网盘分享链接").add_argument("--id", required=True)
     commands.add_parser("destination", help="检查入库目录配置").add_argument("--directory")
-    share = commands.add_parser("share", help="浏览夸克分享文件")
+    share = commands.add_parser("share", help="浏览夸克或百度网盘分享文件")
     download = commands.add_parser("download", help="转存、下载、校验并入库")
     for command in (share, download):
         command.add_argument("--url", required=True)
         command.add_argument("--page", type=positive_int, default=1)
-        command.add_argument("--folder-fid", default="0")
+        command.add_argument("--folder-fid", default="0", help="夸克分享子目录 ID")
+        command.add_argument("--source-dir", help="百度分享子目录的 path")
         command.add_argument("--passcode")
     download.add_argument("--file-fid", required=True)
     download.add_argument("--title", required=True)
@@ -783,15 +985,23 @@ def parse_args():
     download.add_argument("--format", default=DEFAULT_FORMAT, type=str.lower, choices=FORMATS, help="音频格式，默认 FLAC")
     download.add_argument("--directory")
     download.add_argument("--staging-fid", help="从已确认转存成功的暂存目录续接下载")
+    download.add_argument("--staging-dir", help="从 baidu_staging.path 指向的百度暂存目录续接下载")
+    download.add_argument("--mp3-file-fid", help="FLAC 超过夸克下载上限时使用的同页、同版本 MP3 分享文件 ID")
     lyrics = commands.add_parser("lyrics", help="为音乐库内的音频匹配和保存同名 LRC")
     lyrics.add_argument("--path", required=True, help="库内音频路径")
     for field in ("title", "artist", "album", "version"):
         lyrics.add_argument(f"--{field}", help="补充音频中缺少的标签")
     lyrics.add_argument("--source", choices=lyric_sources.SOURCES, help="只查询指定来源")
     lyrics.add_argument("--id", help="使用用户确认的歌词候选 ID，需同时指定 --source")
+    music_batch.add_commands(commands, FORMATS, DEFAULT_FORMAT)
     args = parser.parse_args()
     if args.command == "lyrics" and args.id and not args.source:
         lyrics.error("--id 必须和 --source 一起使用。")
+    if args.command == "download" and args.mp3_file_fid:
+        if args.format != "flac" or share_provider(args.url) != "quark":
+            download.error("--mp3-file-fid 仅适用于夸克 FLAC 下载。")
+        if not QUARK_FID_PATTERN.fullmatch(args.mp3_file_fid) or args.mp3_file_fid == args.file_fid:
+            download.error("请提供不同于 FLAC 的有效 MP3 分享文件 ID。")
     return args
 
 
@@ -818,18 +1028,28 @@ def main():
             }
         elif args.command == "share":
             context["stage"] = "configuration"
-            result = share_page(Quark(context), args)
+            result = browse_share(share_client(args, context), args)
+        elif args.command.startswith("batch-"):
+            result = music_batch.dispatch(args, sys.modules[__name__])
         else:
             result = download(args, context)
+    except BaiduError as error:
+        status = "waiting_transfer" if error.kind == "pending" else "error"
+        print(json.dumps({"status": status, **context, "error_code": error.kind or error.code,
+                          "message": str(error)}, ensure_ascii=False))
+        return int(status == "error")
     except (SkillError, OSError, ValueError, KeyError, TypeError, AttributeError,
             sqlite3.Error, subprocess.TimeoutExpired) as error:
         if isinstance(error, SkillError) and error.required_setting:
             context["required_setting"] = error.required_setting
+        if isinstance(error, DownloadSizeLimit):
+            context.update(error_code="download_size_limit", limit_bytes=error.limit_bytes)
         message = "等待外部命令超时，请检查当前步骤的结果。" if isinstance(error, subprocess.TimeoutExpired) else str(error)
         print(json.dumps({"status": "error", **context, "message": message}, ensure_ascii=False))
         return 1
-    if "quark_staging" in context:
-        result["quark_staging"] = context["quark_staging"]
+    for field in ("quark_staging", "baidu_staging", "fallback"):
+        if field in context:
+            result[field] = context[field]
     print(json.dumps({"status": "ok", **result}, ensure_ascii=False))
     return int(result.get("status") == "error")
 

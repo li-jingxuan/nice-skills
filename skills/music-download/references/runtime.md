@@ -6,6 +6,7 @@
 
 - 搜索需要 Python 3.9+ 及访问 `https://so.liumingye.cn` 的网络。脚本使用 Python 标准库。
 - 转存和下载使用 Node.js 运行已配置的夸克网盘 Skill。`MUSIC_QUARK_CLI` 填 `quark-drive.cjs` 的绝对路径。夸克 CLI 1.0.11 和 1.0.25 会先检查当前运行环境。在 OpenCode 中直接运行时，实测返回 `-104`。请通过夸克可识别的实际运行环境调用，例如 OpenClaw 或 Codex。可先用 `resolve-agent` 检查环境，再通过夸克官方授权流程登录。脚本复用 CLI 的登录状态。
+- 百度分享使用官方 `bdpan`，从 `PATH` 查找，可以用 `MUSIC_BAIDU_CLI` 指定可执行文件。安装官方 `baidu-drive` Skill 后，按其登录流程给当前运行账号授权。CLI 需支持 `bdpan transfer list --help` 和 `bdpan transfer select --help`，官方 Skill 1.7.7 对应 `bdpan` 3.8.9。每个百度任务使用 `/apps/bdpan/music-download-…` 下的独立暂存目录，远端副本保留。 [官方安装与授权文档](https://github.com/baidu-netdisk/bdpan-storage)
 - `MUSIC_LIBRARY_ROOT` 指定已存在的音乐库根目录，例如 `/music`。`MUSIC_LIBRARY_DEFAULT_DIR` 可指定默认目录，例如 `/music/华语`。本次使用 `--directory` 可覆盖默认值。相对路径以音乐库根目录为基准，目标可以是根目录或其子目录。容器内应配置已挂载、可写且支持硬链接的目录。
 - `MUSIC_LIBRARY_DB` 可指定 SQLite 文件路径。默认在技能目录下运行时生成 `data/library.sqlite3`。如果技能目录只读或者升级时会替换整个技能，建议指向 OpenClaw 可写的持久化目录，例如 `/var/lib/openclaw/music/library.sqlite3`。SQLite 使用 Python 标准库。
 - 入库还需要 `ffprobe`。下载使用系统临时目录，可通过 `TMPDIR` 调整位置。夸克网盘每次在默认位置创建一个 `music-download-…` 暂存目录；也可预先通过 `MUSIC_QUARK_STAGING_PARENT_FID` 指定它的父目录 ID。网盘暂存副本留在夸克网盘中，本地临时音频由脚本清理。
@@ -34,7 +35,7 @@ python3 scripts/music_download.py destination
 python3 scripts/music_download.py destination --directory '/music/华语'
 ```
 
-搜索支持 `--page`，响应的 `next_page` 有值时可继续查询。只有夸克标签的条目会列入候选。详情结果中的 `downloads` 包含 `url` 和 `format`，格式未知时 `format` 为 `null`。
+搜索支持 `--page`，响应的 `next_page` 有值时可继续查询。夸克和百度网盘标签的条目都会列入候选。详情结果中的 `downloads` 包含 `url` 和 `format`，格式未知时 `format` 为 `null`。
 
 ```bash
 python3 scripts/music_download.py search --title '成都' --artist '赵雷'
@@ -42,9 +43,11 @@ python3 scripts/music_download.py detail --id '选中的歌曲ID'
 python3 scripts/music_download.py share --url 'https://pan.quark.cn/s/example'
 ```
 
-`share` 输出可用的音频和目录。下一页用 `--page`，子目录用 `--folder-fid`。链接有提取码时保留 URL 中的 `pwd`，或传 `--passcode`。`download` 沿用选中文件所在的分享链接、`--page`、`--folder-fid` 和提取码，复查选中的 `--file-fid`。可传 `--version '现场版'`、`--album '专辑名'` 将确认过的信息写入索引。歌名已经带有版本后缀时沿用全名。如果歌名没有后缀且传了 `--version`，脚本会在文件名末尾附上版本。
+`share` 输出可用的音频和目录。下一页用 `--page`。夸克子目录用 `--folder-fid`，百度子目录用 `--source-dir` 传目录条目的 `path`。链接有提取码时保留 URL 中的 `pwd`，或传 `--passcode`。`download` 沿用选中文件所在的链接、页码、子目录及提取码，复查 `--file-fid`。可传 `--version '现场版'`、`--album '专辑名'` 将确认过的信息写入索引。歌名已经带有版本后缀时沿用全名。如果歌名没有后缀且传了 `--version`，脚本会在文件名末尾附上版本。
 
-`download` 默认使用 FLAC。其他格式须由用户指定或确认，例如 `--format mp3`。
+聊天流程先用正式发行信息和分享文件确认原唱及录音版本，再调用 `download`。默认顺序为夸克 FLAC → 百度 FLAC → 夸克 MP3 → 百度 MP3。批量在同一音质内按实际分享链接归类，跨下歌吧条目先核对夸克。切换到 MP3 时记录 `format_fallback`，`--flac-only` 只查两家的 FLAC。无法确认原唱或存在录音版本歧义时，用 `search`、`detail` 和 `share` 整理可用歌源，等待用户选定文件。
+
+`download` 默认使用 FLAC。可用 `--format mp3` 下载已确认的 MP3。若已查过同版本的百度 FLAC，且同一夸克分享页另有合适的 MP3，可显式传 `--mp3-file-fid`，供指定的夸克 FLAC 超限时回退。
 
 ```bash
 python3 scripts/music_download.py download \
@@ -53,6 +56,20 @@ python3 scripts/music_download.py download \
 ```
 
 已确认转存成功但后续步骤失败时，保留原分享和文件参数，并传 `--staging-fid` 指定结果中 `quark_staging.fid` 对应的目录。脚本直接定位该目录中的文件，避免重复转存。夸克 CLI 1.0.25 可用 `browse` 按目录读取结果，旧版使用搜索结果核对父目录、文件名和字节数。
+
+百度分享会按文件 ID 转存单个音频，再在对应暂存目录核对文件名和字节数。下面示例中的文件 ID 和目录来自 `share` 的结果。
+
+```bash
+python3 scripts/music_download.py share \
+  --url 'https://pan.baidu.com/s/example?pwd=abcd' --source-dir '/专辑目录' --page 2
+python3 scripts/music_download.py download \
+  --url 'https://pan.baidu.com/s/example?pwd=abcd' --source-dir '/专辑目录' --page 2 \
+  --file-fid '9007199254740993' --artist '赵雷' --title '成都' --directory '/music/华语'
+```
+
+`waiting_transfer` 表示暂存目录还未出现可核对的文件。保留响应中的 `baidu_staging`，稍后将其中的 `path` 作为 `--staging-dir` 加到原命令，继续核对原目录。原分享需要可访问，以复查选中文件的信息。若单曲返回 `error_code: busy` 和 `baidu_staging.submitted: false`，说明本次明确未提交，约五分钟后可用原命令重试。批量续跑会自动沿用已保存的音频信息、暂存目录和任务 ID。
+
+夸克返回 `download file size limit[52428800]` 这类单文件上限错误时，脚本给出 `error_code: download_size_limit` 和 `limit_bytes`，具体数值来自夸克响应。默认选源先切换到百度的相同音质，夸克上限仅用于夸克文件。显式传了同页的 `--mp3-file-fid` 时，脚本核对 MP3 格式及大小后自动转存和下载，并用 `fallback` 记录格式变更、上限和原暂存目录。切换到其他分享页或链接时，Skill 使用对应文件自己的分享参数。
 
 脚本返回一行 JSON。入库成功时返回 `status`、`path`、`format` 和 `size`。同名且内容相同返回 `exists`，同名冲突返回 `error`。`saved` 和 `exists` 都会写入索引。若 NAS 文件已就绪但索引写入失败，结果保留成功状态并附上 `index_warning`。错误的 `stage` 标识失败环节。若已创建夸克暂存目录，响应附带 `quark_staging`。执行工具的超时应覆盖转存和下载，长任务可用后台模式等待结果。遇到超时或转存后尚未搜到文件时，先根据 `quark_staging` 检查远端状态，再决定是否重试。
 
@@ -70,4 +87,31 @@ python3 scripts/music_download.py lyrics --path '/music/华语/赵雷 - 少女.f
 
 默认按 `lrclib`、`netease`、`qq`、`kugou` 的顺序查找。`--source` 可限定一家，选定 ID 时需要同时传 `--source`。同一可信等级有多个不同时间轴时返回 `needs_review`，可用其中的 `source` 和 `id` 续接。只返回纯文本、缺少有效时间戳或时间轴超出音频时长的歌词会跳过。
 
+脚本根据时间轴正文的中文特征字判断字形，通常跳过署名和版权行。遇到繁体或字形不明确的中文歌词时，继续找同等或更高可信度的简体 LRC，找不到时使用当前匹配结果。英文等其他语言沿用默认顺序。保存原文和原时间轴。响应中的 `language` 为 `zh-Hans`、`zh-Hant` 或 `zh`，后者表示简繁混合或缺少足够的特征字。
+
 `saved` 返回 `.lrc` 路径、来源、ID、候选元数据和有效时间戳条数。歌词使用 UTF-8，通过同目录暂存后发布。已有同名 `.lrc` 时返回 `exists`。`not_found` 表示没有匹配的时间轴，`unavailable` 表示有来源暂时未能查询，`error` 表示本地读取或写入失败。以上歌词状态独立于音频的下载、校验和入库结果。
+
+### 批量下载与续跑
+
+`batch-add` 接收 UTF-8 文本、JSON 曲目数组和 `kugou-playlist` 导出的版本 1 JSON 清单。文本每行使用 `歌名` 或 `歌手 - 歌名`。手填 JSON 数组的每项可以是歌名字符串，或使用 `{"title":"成都","artist":"赵雷","album":"无法长大","version":null}`。`title` 必填，`artist`、`album`、`version` 可省略或填 `null`。目录和音质沿用单曲参数，`--flac-only` 禁止切换到 MP3。
+
+将酷狗 `tracks --for-download` 返回的临时清单路径传给 `--consume-manifest`。批量入口检查 `schema_version: 1`、`source: "kugou"`、`read_status` 及曲目计数，按 `tracks` 原顺序读取匹配字段。`read_status: partial` 时先确认是否处理已读取曲目，再加 `--allow-partial`。缺少歌名时会报告位置，补齐后即可重新导入。
+
+`--consume-manifest` 在 SQLite 提交后删除临时清单，导入失败时保留文件。对同一清单用原参数重试会返回已有批次，也可补做清理。若返回 `manifest_cleanup_warning`，批次已可运行。`--input` 适用于用户提供的文件和普通导出清单，导入后保留文件。
+
+```bash
+python3 scripts/music_download.py batch-add --input '/tmp/歌曲清单.txt' --directory '/music/华语'
+python3 scripts/music_download.py batch-add --consume-manifest '<酷狗 --for-download 返回的 manifest_path>' --directory '/music/华语'
+python3 scripts/music_download.py batch-run --job '<批次 ID>' --workers 10
+python3 scripts/music_download.py batch-run --job '<批次 ID>' --continue-review
+python3 scripts/music_download.py batch-status --job '<批次 ID>'
+python3 scripts/music_download.py batch-status --job '<批次 ID>' --state failed
+python3 scripts/music_download.py batch-status --job '<批次 ID>' --state no_source
+python3 scripts/music_download.py batch-select --job '<批次 ID>' --item 3 --track-id '<歌曲 ID>'
+```
+
+状态保存在音乐库索引旁的 `batches.sqlite3`，可通过 `MUSIC_BATCH_DB` 指向运行主机上的持久化可写文件。一次只运行该数据库中的一个批次，可在运行期间查询状态。`--workers` 有效范围是 1 到 10，默认 10。普通单曲错误最多额外重试 5 次，逐次退避。明确限流时暂停派发新任务，按服务端 `Retry-After` 或退避时间等待，并调低当次运行的并发数。明确超限且无法回退时记录失败，无匹配音源时记录 `no_source`。授权、转存额度、存储或索引等共用故障令批次暂停，恢复后用原批次 ID 继续。
+
+`batch-status` 返回统计和逐曲记录，`--state` 可筛选状态，`--offset`、`--limit` 可翻页。只给歌名时，批次先用网易云和 QQ 音乐的正式专辑条目交叉核对演唱者，再匹配下歌吧条目。无法核实时记为 `needs_review`，其他曲目会继续处理，批次结束时集中查看这些记录。待确认达到 10 首时批次提前暂停。用户确认继续后，恢复命令加 `--continue-review`，本次会处理剩余队列，待确认项仍保留。可按 `position` 用 `batch-select` 选择已经确认的下歌吧条目。选择具体文件时加 `--url`、`--file-fid`、`--page` 和对应子目录参数，必要时传 `--passcode`。选定后仍用原批次 ID 运行。
+
+续跑沿用已选文件和网盘暂存位置。百度转存结果未知时记为 `waiting_transfer`，保留暂存目录及 CLI 已返回的 `task_id`，下次运行原批次时复查目录。服务端报告有其他任务正在转存时，五分钟后才重新领取该曲。等待状态允许其他曲目继续，也保留单曲的下载重试次数。下载中断时从可验证的阶段继续。已经完成校验并记录待发布哈希的文件可恢复发布或补写索引。续跑时会复查已完成的音频路径和大小，将缺失或大小变化的记录排回队列。`failed` 保留错误阶段和历次失败信息，`no_source` 保留未找到可用来源的原因。LRC 查询结果记在逐曲结果中。
