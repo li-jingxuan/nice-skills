@@ -537,10 +537,10 @@ def create_staging_folder(quark, args, selected):
     parent = os.environ.get("MUSIC_QUARK_STAGING_PARENT_FID")
     folder_options = ["--parent-fid", require_id(parent, "网盘暂存父目录 ID")] if parent else []
     folder, _ = quark.run("create-folder", "--dir-path", folder_name, *folder_options, stage="create_staging")
-    quark.context["quark_staging"] = {"name": folder_name, "path": folder.get("full_path"), "fid": folder.get("fid")}
+    quark.context["quark_staging"] = {"name": folder_name, "path": folder.get("full_path"), "fid": folder.get("fid"),
+                                      "filename": selected["filename"], "size": selected["size"]}
     folder_id = require_id(folder.get("fid"), "网盘暂存目录 ID")
     if checkpoint := getattr(args, "_checkpoint", None):
-        quark.context["quark_staging"].update(filename=selected["filename"], size=selected["size"])
         checkpoint(staging={**quark.context["quark_staging"], "saved": False})
     return folder_id
 
@@ -577,7 +577,7 @@ def transfer(quark, args, selected, local_dir):
         file_fid = None
         if args.staging_fid:
             folder_id = require_id(args.staging_fid, "网盘暂存目录 ID")
-            quark.context["quark_staging"] = staging or {"fid": folder_id}
+            quark.context["quark_staging"] = staging or {"fid": folder_id, "filename": selected["filename"]}
             # 批量恢复时，确认此前未提交且目录为空，才在原目录补做转存。
             allow_empty = bool(staging) and not (staging.get("saved") or staging.get("submitted"))
             file_fid = locate_saved_file(quark, folder_id, selected, local_dir, allow_empty=allow_empty)
@@ -860,6 +860,29 @@ def publish(staged, destination):
     return "saved"
 
 
+def cleanup_staging(result, staging, *, checkpoint=None, client=None):
+    if not staging:
+        return
+    location = {key: staging[key] for key in ("path", "name", "fid", "filename") if staging.get(key)}
+    if staging.get("provider") != "baidu":
+        result["staging_cleanup"] = {
+            **location, "provider": "quark", "status": "manual",
+            "message": "夸克官方 CLI 暂不支持删除，可在网盘客户端将本次暂存副本移入回收站。",
+        }
+        return
+    cleanup = result["staging_cleanup"] = {**location, "provider": "baidu", "status": "removed"}
+    if not staging.get("remote_fsid"):
+        cleanup.update(status="manual", message="缺少百度网盘暂存副本的文件 ID，请核对后手动清理。")
+        return
+    if checkpoint and not staging.get("cleanup_started"):
+        # 删除前记下恢复点。若进程中断，可用已验证的 NAS 文件恢复并再次核对网盘。
+        checkpoint(staging={**staging, "cleanup_started": True})
+    try:
+        (client if client is not None else Baidu({})).remove_staged_file(staging)
+    except (BaiduError, OSError, TypeError, KeyError, AttributeError) as error:
+        cleanup.update(status="warning", message=str(error))
+
+
 def download(args, context):
     try:
         return download_file(args, context)
@@ -931,7 +954,10 @@ def download_file(args, context, *, limit_bytes=None):
         status = publish(staged, destination)
     finally:
         staged.unlink(missing_ok=True)
-    return finish_download(args, destination, audio_info, status=status)
+    result = finish_download(args, destination, audio_info, status=status)
+    staging = context.get("baidu_staging" if baidu else "quark_staging")
+    cleanup_staging(result, staging, checkpoint=checkpoint, client=client)
+    return result
 
 
 def finish_download(args, destination, audio_info, *, status):

@@ -13,6 +13,7 @@ from uuid import uuid4
 FILE_ID = re.compile(r"[1-9][0-9]*")
 APP_ROOT = "/apps/bdpan/"
 STAGING_DIR = re.compile(r"/apps/bdpan/music-download-[a-f0-9]{32}")
+STAGING_LIST_LIMIT = 1000
 AUTH_CODES = {-6, 13998, 13080, 13081}
 REJECTED_CODES = {13003, 13004, 13041, 13061, 13071, 13072, 13073, 20013}
 
@@ -33,6 +34,10 @@ def numeric_field(value):
 
 def share_options(args):
     return ["-p", args.passcode] if args.passcode else []
+
+
+def valid_filename(name):
+    return isinstance(name, str) and bool(name) and name not in (".", "..") and not re.search(r"[/\x00-\x1f\x7f]", name)
 
 
 class Baidu:
@@ -90,6 +95,8 @@ class Baidu:
             if code in AUTH_CODES or re.search(r"未登录|未授权|请先登录|not (?:logged in|authorized)", diagnostic, re.I):
                 raise BaiduError("请通过官方 baidu-drive Skill 登录或检查百度网盘授权。", "auth", code=code)
             if re.search(r"unknown (?:command|flag)|未知命令|未知参数", diagnostic, re.I):
+                if stage == "cleanup":
+                    raise BaiduError("当前 bdpan 不支持自动删除暂存副本。", "configuration", code=code)
                 raise BaiduError("请升级到支持 transfer list 和 transfer select 的官方 bdpan。", "configuration", code=code)
             suffix = f"（错误码 {code}）" if code is not None else ""
             raise BaiduError(f"百度网盘命令未返回成功结果{suffix}。", code=code)
@@ -121,18 +128,41 @@ class Baidu:
                           "type": "folder" if directory else "audio", "format": None if directory else audio_format})
         return {"files": files, "next_page": args.page + 1 if entries and data["has_more"] else None}
 
-    def locate(self, staging):
-        entries = self.run("ls", staging["path"], stage="locate")
+    def locate(self, staging, *, cleanup=False):
+        options = ["--limit", str(STAGING_LIST_LIMIT)] if cleanup else []
+        entries = self.run("ls", staging["path"], *options, stage="cleanup" if cleanup else "locate")
         if not isinstance(entries, list):
             raise BaiduError("百度网盘未返回暂存目录的文件列表。")
+        if cleanup and len(entries) >= STAGING_LIST_LIMIT:
+            raise BaiduError("百度网盘未返回暂存目录的完整文件列表。")
         # 暂存目录仅接收一个文件，核对直属路径、名称和大小后才允许下载。
         path = staging["path"] + "/" + staging["filename"]
-        matches = [item for item in entries if item.get("path") == path
-                   and item.get("isdir", item.get("is_dir")) in (False, 0, "0")
-                   and numeric_field(item.get("size")) == staging["size"]]
-        if entries and len(matches) != 1:
+        named = [item for item in entries if item.get("path") == path]
+        if not named and (cleanup or not entries):
+            return None
+        if (len(named) != 1 or named[0].get("isdir", named[0].get("is_dir")) not in (False, 0, "0")
+                or numeric_field(named[0].get("size")) != staging["size"]):
             raise BaiduError("百度网盘暂存目录未能唯一匹配所选音频，请核对文件名和大小。")
-        return path if matches else None
+        return named[0]
+
+    def remove_staged_file(self, staging):
+        name = staging.get("filename")
+        if not STAGING_DIR.fullmatch(staging.get("path") or "") or not valid_filename(name) or name != name.strip():
+            raise BaiduError("百度网盘暂存路径无效。")
+        entry = self.locate(staging, cleanup=True)
+        if entry is None:
+            return
+        fid = numeric_field(entry.get("fs_id") or entry.get("fsid"))
+        if fid is None or fid <= 0 or fid != staging.get("remote_fsid"):
+            raise BaiduError("百度网盘暂存文件 ID 已变化，请核对副本。")
+        failure = None
+        try:
+            self.run("rm", entry["path"], "--force", stage="cleanup")
+        except BaiduError as error:
+            # 命令超时或响应不完整时，仍可用网盘目录确认删除是否生效。
+            failure = error
+        if self.locate(staging, cleanup=True) is not None:
+            raise failure or BaiduError("百度网盘暂存文件仍可见，暂时无法确认删除结果。")
 
     def transfer(self, args, selected, local_dir):
         checkpoint = getattr(args, "_checkpoint", None)
@@ -146,7 +176,7 @@ class Baidu:
                 checkpoint(staging=dict(staging))
 
         name = selected["filename"]
-        if not name or name in (".", "..") or "/" in name or re.search(r"[\x00-\x1f\x7f]", name):
+        if not valid_filename(name):
             raise BaiduError("百度网盘分享未返回有效的音频文件名。")
         folder = staging.get("path") or manual_path or f"{APP_ROOT}music-download-{uuid4().hex}"
         if not STAGING_DIR.fullmatch(folder):
@@ -176,9 +206,9 @@ class Baidu:
             if delay:
                 time.sleep(delay)
             if remote := self.locate(staging):
-                remember(saved=True)
+                remember(saved=True, remote_fsid=numeric_field(remote.get("fs_id") or remote.get("fsid")))
                 local = local_dir / f"audio.{args.format}"
-                self.run("download", remote, str(local), stage="download", timeout=900)
+                self.run("download", remote["path"], str(local), stage="download", timeout=900)
                 if local.is_symlink() or not local.is_file():
                     raise BaiduError("百度网盘未在本地暂存目录生成音频文件。")
                 return local

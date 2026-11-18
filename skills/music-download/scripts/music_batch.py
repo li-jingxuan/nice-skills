@@ -575,6 +575,12 @@ def download_track(music, options, state, context, checkpoint, audio_format):
     if record := state.get("publish"):
         args = argparse.Namespace(**track, format=audio_format)
         result = restore_published(music, args, record, part)
+        staging = state.get("staging") or {}
+        if result is not None:
+            music.cleanup_staging(result, staging, checkpoint=checkpoint)
+        elif staging.get("cleanup_started"):
+            # NAS 文件已缺失，原网盘副本可能已删除。从已选分享重新转存。
+            checkpoint(publish=None, part=None, staging=None)
     # 没有发布记录时，残留的 .part 可能只写了一部分。删除后从网盘恢复点继续。
     if part is not None:
         part.unlink(missing_ok=True)

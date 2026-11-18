@@ -6,10 +6,10 @@
 
 - 搜索需要 Python 3.9+ 及访问 `https://so.liumingye.cn` 的网络。脚本使用 Python 标准库。
 - 转存和下载使用 Node.js 运行已配置的夸克网盘 Skill。`MUSIC_QUARK_CLI` 填 `quark-drive.cjs` 的绝对路径。夸克 CLI 1.0.11 和 1.0.25 会先检查当前运行环境。在 OpenCode 中直接运行时，实测返回 `-104`。请通过夸克可识别的实际运行环境调用，例如 OpenClaw 或 Codex。可先用 `resolve-agent` 检查环境，再通过夸克官方授权流程登录。脚本复用 CLI 的登录状态。
-- 百度分享使用官方 `bdpan`，从 `PATH` 查找，可以用 `MUSIC_BAIDU_CLI` 指定可执行文件。安装官方 `baidu-drive` Skill 后，按其登录流程给当前运行账号授权。CLI 需支持 `bdpan transfer list --help` 和 `bdpan transfer select --help`，官方 Skill 1.7.7 对应 `bdpan` 3.8.9。每个百度任务使用 `/apps/bdpan/music-download-…` 下的独立暂存目录，远端副本保留。 [官方安装与授权文档](https://github.com/baidu-netdisk/bdpan-storage)
+- 百度分享使用官方 `bdpan`，从 `PATH` 查找，可以用 `MUSIC_BAIDU_CLI` 指定可执行文件。安装官方 `baidu-drive` Skill 后，按其登录流程给当前运行账号授权。CLI 需支持 `transfer list`、`transfer select` 和 `rm`，官方 Skill 1.7.7 对应 `bdpan` 3.8.9。每个百度任务使用 `/apps/bdpan/music-download-…` 下的独立暂存目录。 [官方安装与授权文档](https://github.com/baidu-netdisk/bdpan-storage)
 - `MUSIC_LIBRARY_ROOT` 指定已存在的音乐库根目录，例如 `/music`。`MUSIC_LIBRARY_DEFAULT_DIR` 可指定默认目录，例如 `/music/华语`。本次使用 `--directory` 可覆盖默认值。相对路径以音乐库根目录为基准，目标可以是根目录或其子目录。容器内应配置已挂载、可写且支持硬链接的目录。
 - `MUSIC_LIBRARY_DB` 可指定 SQLite 文件路径。默认在技能目录下运行时生成 `data/library.sqlite3`。如果技能目录只读或者升级时会替换整个技能，建议指向 OpenClaw 可写的持久化目录，例如 `/var/lib/openclaw/music/library.sqlite3`。SQLite 使用 Python 标准库。
-- 入库还需要 `ffprobe`。下载使用系统临时目录，可通过 `TMPDIR` 调整位置。夸克网盘每次在默认位置创建一个 `music-download-…` 暂存目录；也可预先通过 `MUSIC_QUARK_STAGING_PARENT_FID` 指定它的父目录 ID。网盘暂存副本留在夸克网盘中，本地临时音频由脚本清理。
+- 入库还需要 `ffprobe`。下载使用系统临时目录，可通过 `TMPDIR` 调整位置。夸克网盘每次在默认位置创建一个 `music-download-…` 暂存目录。也可预先通过 `MUSIC_QUARK_STAGING_PARENT_FID` 指定它的父目录 ID。脚本清理本地临时音频。
 - 脚本复用已准备好的 CLI，通过命令参数传入所需链接、文件 ID 和路径。夸克 CLI 的 `--session-input` 是可选的质量追踪参数，脚本省略原始对话正文。
 - 歌词需要 `ffprobe` 及通往 `lrclib.net`、`music.163.com`、`c.y.qq.com`、`lyrics.kugou.com` 的网络。已实测四个来源均可匿名获取赵雷《少女》的时间轴歌词，无需 Cookie、账号登录或 VIP。QQ 请求带网页来源请求头。酷狗的 `accesskey` 来自歌词搜索响应，与账号授权无关。平台接口可能限流、调整或只为部分歌曲返回歌词。
 
@@ -72,6 +72,8 @@ python3 scripts/music_download.py download \
 夸克返回 `download file size limit[52428800]` 这类单文件上限错误时，脚本给出 `error_code: download_size_limit` 和 `limit_bytes`，具体数值来自夸克响应。默认选源先切换到百度的相同音质，夸克上限仅用于夸克文件。显式传了同页的 `--mp3-file-fid` 时，脚本核对 MP3 格式及大小后自动转存和下载，并用 `fallback` 记录格式变更、上限和原暂存目录。切换到其他分享页或链接时，Skill 使用对应文件自己的分享参数。
 
 脚本返回一行 JSON。入库成功时返回 `status`、`path`、`format` 和 `size`。同名且内容相同返回 `exists`，同名冲突返回 `error`。`saved` 和 `exists` 都会写入索引。若 NAS 文件已就绪但索引写入失败，结果保留成功状态并附上 `index_warning`。错误的 `stage` 标识失败环节。若已创建夸克暂存目录，响应附带 `quark_staging`。执行工具的超时应覆盖转存和下载，长任务可用后台模式等待结果。遇到超时或转存后尚未搜到文件时，先根据 `quark_staging` 检查远端状态，再决定是否重试。
+
+音频校验并发布到 NAS 后，百度会按路径、文件 ID 和字节数核对并删除本次转存的单个音频。暂存目录保留。未完成音频校验或发布时，暂存副本保留供续接。`staging_cleanup.status` 为 `removed` 表示已确认暂存音频不在百度暂存目录。为 `manual` 或 `warning` 时，返回暂存位置和原因，音频仍已入库。夸克官方 CLI 暂无删除命令，可用返回的位置在客户端将对应副本移入回收站。批量任务的逐曲 `result` 也会记录清理结果。
 
 ### 查找并保存 LRC
 
