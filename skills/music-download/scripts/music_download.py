@@ -107,9 +107,17 @@ def quark_url(value):
 
 
 def source_json(url):
-    request = Request(url, headers={"Accept": "application/json"})
+    request = Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    })
     with urlopen(request, timeout=20) as response:
-        data = json.load(response)
+        raw = response.read()
+    if raw[:2] == b"\x1f\x8b":
+        import gzip
+        raw = gzip.decompress(raw)
+    data = json.loads(raw.decode("utf-8"))
     if not isinstance(data, dict):
         raise SkillError("下歌吧返回了未知的数据格式。")
     return data
