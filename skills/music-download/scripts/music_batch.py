@@ -258,7 +258,7 @@ def report(db, job, args=None):
     return result
 
 
-def select_item(db, args, music):
+def select_item(db, args, music, *, allow_queued_review=False):
     options_for(db, args.job)
     music.require_id(args.track_id, "歌曲 ID", pattern=music.ID_PATTERN)
     selection = {"track_id": args.track_id}
@@ -283,9 +283,13 @@ def select_item(db, args, music):
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT status, details FROM items WHERE job = ? AND position = ?",
                          (args.job, args.item)).fetchone()
-        if not row or row[0] not in {"needs_review", "no_source"}:
+        if not row:
             raise ValueError("请选择待确认或无音源的曲目编号。")
         prior = json.loads(row[1])
+        queued_review = (allow_queued_review and row[0] == "queued" and prior.get("candidates")
+                         and not (prior.get("selection") or prior.get("file") or prior.get("staging")))
+        if row[0] not in {"needs_review", "no_source"} and not queued_review:
+            raise ValueError("请选择待确认或无音源的曲目编号。")
         details = {"track": prior["track"], "selection": selection, "errors": prior["errors"]}
         write_item(db, args.job, args.item, "queued", details)
     return report(db, args.job)
@@ -297,10 +301,9 @@ def resolve_track(music, track, selection):
         item = music.track_detail(argparse.Namespace(id=selection["track_id"]))
         title, version = music.lyric_song_version(item["title"], track["version"])
         version = item.get("version") or version or ""
-        if music.song_key(title) != music.song_key(track["title"]) or not item.get("artist"):
+        if title_key(music, title) != title_key(music, track["title"]) or not item.get("artist"):
             raise ValueError("选中的条目与歌名不符，或缺少歌手。")
-        return [(item, version)], False
-    # 搜到页数上限时返回未查完的标记，由调用方保留候选供人工确认。
+        return [(item, version)]
     page = 1
     choices = {}
     while page is not None and page <= 10:
@@ -308,7 +311,7 @@ def resolve_track(music, track, selection):
         for item in result["tracks"]:
             title, version = music.lyric_song_version(item["title"] or "", track["version"])
             version = item.get("version") or version or ""
-            if music.song_key(title) != music.song_key(track["title"]) or not item.get("artist"):
+            if title_key(music, title) != title_key(music, track["title"]) or not item.get("artist"):
                 continue
             if track["artist"] and music.artist_key(item["artist"]) != music.artist_key(track["artist"]):
                 continue
@@ -320,7 +323,11 @@ def resolve_track(music, track, selection):
                 continue
             choices[item["id"]] = (item, version)
         page = result["next_page"]
-    return list(choices.values()), page is not None
+    return list(choices.values())
+
+
+def title_key(music, title):
+    return re.sub(r" +(?=\()", "", music.song_key(title))
 
 
 def confirmed_release(music, track):
@@ -341,17 +348,21 @@ def confirmed_release(music, track):
     return next(iter(shared)) if len(shared) == 1 else None
 
 
-def matching_filename(music, filename, track):
+def file_title(music, filename, track):
     stem = Path(filename).stem.strip()
     stem = re.sub(r"^\d+[ ._、-]+", "", stem)
-    base, version = music.lyric_song_version(stem, track["version"])
+    return music.lyric_song_version(stem, track["version"])
+
+
+def matching_filename(music, filename, track):
+    base, version = file_title(music, filename, track)
     if version and music.song_key(version) != music.song_key(track["version"]):
         return False
-    key = music.song_key(base)
+    key = title_key(music, base)
     aliases = [track["title"]]
     for divider in (" - ", "-", " – ", " — ", "—"):
         aliases.extend((track["artist"] + divider + track["title"], track["title"] + divider + track["artist"]))
-    return key in {music.song_key(alias) for alias in aliases}
+    return key in {title_key(music, alias) for alias in aliases}
 
 
 def find_file(music, context, track, audio_format, url, limit):
@@ -364,7 +375,7 @@ def find_file(music, context, track, audio_format, url, limit):
         client.capture_status = True
     queue = deque([(None if baidu else "0", 1)])
     visited = set()
-    found = {}
+    excluded = {file["file_fid"] for file in context.get("oversized_files", ()) if file["url"] == url}
     while queue and len(visited) < 30:
         folder, page = queue.popleft()
         if (folder, page) in visited:
@@ -376,25 +387,26 @@ def find_file(music, context, track, audio_format, url, limit):
         else:
             args.folder_fid = folder
         response = music.browse_share(client, args)
+        found = []
         for item in response["files"]:
             if item["type"] == "folder":
                 child = item.get("path" if baidu else "fid")
                 if child:
                     queue.append((child, 1))
-            elif (item["format"] == audio_format and item["fid"] and isinstance(item["size"], int) and item["size"] > 0
+            elif (item["format"] == audio_format and item["fid"] and item["fid"] not in excluded
+                  and isinstance(item["size"], int) and item["size"] > 0
                   and (baidu or limit is None or item["size"] <= limit)
                   and matching_filename(music, item["filename"], track)):
-                found[item["fid"]] = {"url": url, "file_fid": item["fid"], "folder_fid": args.folder_fid,
-                                      "source_dir": args.source_dir, "page": page, "filename": item["filename"],
-                                      "size": item["size"]}
+                found.append(item)
+        if found:
+            # 同页有多个匹配文件时，优先采用文件名也带歌手的那份。
+            title = title_key(music, track["title"])
+            item = min(found, key=lambda entry: title_key(music, file_title(music, entry["filename"], track)[0]) == title)
+            return {"url": url, "file_fid": item["fid"], "folder_fid": args.folder_fid, "source_dir": args.source_dir,
+                    "page": page, "filename": item["filename"], "size": item["size"]}, None
         if response["next_page"]:
             queue.append((folder, response["next_page"]))
-    files = list(found.values())
-    if queue or len(files) > 1:
-        # 候选保留页码和目录，分享链接只展示到路径，避免在结果中泄露提取码。
-        return None, [{**{key: value for key, value in file.items() if key != "url"},
-                       "share": url.split("?", 1)[0].split("#", 1)[0]} for file in files]
-    return (files[0] if files else None), None
+    return None, [] if queue else None
 
 
 def local_match(music, track, audio_format):
@@ -430,18 +442,24 @@ def restore_published(music, args, record, part):
     return music.finish_download(args, path, audio, status="saved")
 
 
-def choose_source(music, context, track, audio_format, state):
+def source_order(options):
+    if options["format"] == "flac" and not options["flac_only"]:
+        return (("quark", "flac"), ("quark", "mp3"), ("baidu", "flac"), ("baidu", "mp3"))
+    return (("quark", options["format"]), ("baidu", options["format"]))
+
+
+def choose_source(music, context, track, options, state):
     """返回可写入的选源恢复点，或结束当前曲目的状态和原因。"""
     context["stage"] = "search"
     selection = state.get("selection")
     limit = state.get("limit_bytes")
-    choices, more = resolve_track(music, track, selection)
-    if not choices and not more:
+    choices = resolve_track(music, track, selection)
+    if not choices:
         return "no_source", {"reason": "没有找到匹配歌曲的网盘来源。"}
 
     # 只给歌名时，使用两个曲库共同指向的一条录音发行信息来缩小候选范围。
     # 任一来源无法核实、交叉结果不唯一或候选缺少专辑时，保留人工确认入口。
-    if not (track["artist"] or selection or more or track["version"]):
+    if not (track["artist"] or selection or track["version"]):
         release = confirmed_release(music, track)
         verified = [(item, version) for item, version in choices if item.get("album")
                     and (music.artist_key(item["artist"]), music.song_key(item["album"])) == release]
@@ -449,36 +467,21 @@ def choose_source(music, context, track, audio_format, state):
             choices = verified
             track = {**track, "artist": verified[0][0]["artist"], "album": verified[0][0]["album"]}
 
-    # 明确标注其他格式的条目可以排除。「百度云」「夸克网盘」等标签需进入分享核对。
-    eligible = []
-    for item, version in choices:
-        formats = {music.label_format(label) for label in item.get("quality") or []}
-        if not formats or None in formats or audio_format in formats:
-            eligible.append((item, version))
-    if not eligible and choices and not more:
-        return "no_source", {"reason": f"搜索结果没有符合要求的 {audio_format.upper()} 来源。"}
-    choices = eligible
-
-    albums = {music.song_key(item["album"]) for item, _ in choices if item.get("album")}
-    if more or (not selection and (not track["artist"] or len(albums) > 1)):
-        return "needs_review", {"reason": "需要确认原唱、专辑或录音版本。",
+    if not selection and not track["artist"]:
+        return "needs_review", {"reason": "需要确认演唱者。",
                                 "candidates": [item for item, _ in choices]}
 
-    # 人工指定的文件只用于最初请求的音质，且允许在超限后重新选源。
-    supplied_file = selection.get("file") if selection and not (limit or state.get("format_fallback")) else None
-    sources = {"quark": [], "baidu": []}
+    requested_format = options["format"]
+    supplied_file = selection.get("file") if selection and not limit else None
+    sources = {pair: [] for pair in source_order(options)}
     source_errors = []
     detail_conflict = None
+    recordings = []
     for item, version in sorted(choices, key=lambda choice: not choice[0].get("album")):
-        if track["album"] and not item.get("album") and not selection:
-            continue
         resolved = {"title": track["title"], "artist": item["artist"], "version": version,
                     "album": item.get("album") or track["album"]}
-        context["stage"] = "lookup"
-        if existing := local_match(music, resolved, audio_format):
-            return "already_in_library", {"result": existing}
         if supplied_file:
-            return None, {"resolved": resolved, "file": supplied_file}
+            return None, {"resolved": resolved, "file": supplied_file, "file_format": requested_format}
 
         context["stage"] = "detail"
         try:
@@ -490,24 +493,43 @@ def choose_source(music, context, track, audio_format, state):
         detail_title, detail_version = music.lyric_song_version(detail["title"], version)
         album = detail.get("album") or ""
         version_key = music.song_key(version)
-        # 详情是分享链接的出处。歌名后缀和独立版本字段都要与搜索结果一致。
-        if (music.song_key(detail_title) != music.song_key(resolved["title"])
+        # 专辑只在请求明确指定时限制选源。歌名、歌手和已标注的版本仍需一致。
+        if (title_key(music, detail_title) != title_key(music, resolved["title"])
                 or music.artist_key(detail["artist"] or "") != music.artist_key(resolved["artist"])
                 or music.song_key(detail.get("version") or detail_version or "") != version_key
                 or (detail_version and music.song_key(detail_version) != version_key)
                 or (not selection and not version and OTHER_VERSION.search(album))
-                or (album and resolved["album"] and music.song_key(album) != music.song_key(resolved["album"]))):
+                or (not selection and track["album"] and music.song_key(album or item.get("album") or "")
+                    != music.song_key(track["album"]))):
             if detail_conflict is None:
                 detail_conflict = [music.track_fields(item), music.track_fields(detail)]
             continue
-        urls = dict.fromkeys(entry["url"] for entry in detail["downloads"] if entry["format"] in (audio_format, None))
-        for url in urls:
-            sources[music.share_provider(url)].append((url, resolved, item))
+        resolved["album"] = album or resolved["album"]
+        recordings.append(resolved)
+        for url, file_format in dict.fromkeys((entry["url"], entry["format"]) for entry in detail["downloads"]):
+            provider = music.share_provider(url)
+            for pair, candidates in sources.items():
+                if pair[0] == provider and file_format in (None, pair[1]):
+                    candidates.append((url, resolved, item))
 
-    # 同一音质先遍历所有夸克链接，再遍历所有百度链接。以详情的实际链接归类，避免混合标签或条目顺序改变优先级。
-    providers = ("baidu",) if state.get("quark_limited_format") == audio_format else ("quark", "baidu")
-    for provider in providers:
-        for url, resolved, item in sources[provider]:
+    incomplete = None
+    checked_library = set()
+    context["oversized_files"] = state.get("oversized_files", ())
+    for (provider, audio_format), candidates in sources.items():
+        if audio_format not in checked_library:
+            checked_library.add(audio_format)
+            context["stage"] = "lookup"
+            for resolved in recordings:
+                if existing := local_match(music, resolved, audio_format):
+                    return "already_in_library", {"result": existing}
+        if provider == "quark" and audio_format == state.get("quark_limited_format"):
+            continue
+        checked = set()
+        for url, resolved, item in candidates:
+            link = (url, resolved["artist"], resolved["version"])
+            if link in checked:
+                continue
+            checked.add(link)
             # 一个分享失效、缺提取码或网盘尚未配置时，仍可尝试同录音同格式的其他链接。
             attempt = context.copy()
             try:
@@ -517,10 +539,11 @@ def choose_source(music, context, track, audio_format, state):
                     source_errors.append((error, attempt, item, url))
                 continue
             if ambiguous is not None:
-                return "needs_review", {"reason": "分享中有多个可能文件或未能完整核对目录。",
-                                        "candidates": [{**music.track_fields(item), "files": ambiguous}]}
+                incomplete = incomplete or {**music.track_fields(item), "files": ambiguous}
             if selected_file:
-                return None, {"resolved": resolved, "file": selected_file}
+                return None, {"resolved": resolved, "file": selected_file, "file_format": audio_format}
+    if incomplete is not None:
+        return "needs_review", {"reason": "未能完整核对分享目录。", "candidates": [incomplete]}
     if detail_conflict is not None:
         return "needs_review", {"reason": "搜索条目与歌曲详情的演唱者或版本信息不一致。",
                                 "candidates": detail_conflict}
@@ -532,43 +555,44 @@ def choose_source(music, context, track, audio_format, state):
                                       "share": url.split("?", 1)[0].split("#", 1)[0]}]}
         context.update(attempt)
         raise error
-    return "no_source", {"reason": f"没有找到与该版本匹配且符合要求的 {audio_format.upper()} 文件。"}
+    formats = "、".join(dict.fromkeys(audio_format.upper() for _, audio_format in sources))
+    return "no_source", {"reason": f"没有找到与歌名、歌手及指定版本匹配的 {formats} 文件。"}
 
 
 def process_track(music, options, state, context, checkpoint):
-    """按音质推进选源。夸克超限时先查同音质的百度来源。"""
-    audio_format = options["format"]
-    # 旧队列只记录 limit_bytes，其已有下载恢复点对应 MP3。
-    legacy_fallback = state.get("limit_bytes") and not state.get("quark_limited_format")
-    if audio_format == "flac" and (legacy_fallback or state.get("format_fallback")):
-        audio_format = "mp3"
+    """沿用已落盘的文件，重新选源时按网盘和音质优先级推进。"""
     while True:
         try:
-            status, outcome = download_track(music, options, state, context, checkpoint, audio_format)
+            status, outcome = download_track(music, options, state, context, checkpoint)
         except music.DownloadSizeLimit as error:
             previous_staging = state.get("staging")
-            for key in ("file", "staging", "part", "publish"):
-                state.pop(key, None)
             context.pop("quark_staging", None)
-            # 同时记录上限及已尝试的夸克音质，并清理该文件的恢复点。重启仍会接着查百度相同音质。
-            checkpoint(limit_bytes=error.limit_bytes, quark_limited_format=audio_format,
+            file = state["file"]
+            oversized = [*state.get("oversized_files", ()), {key: file[key] for key in ("url", "file_fid")}]
+            checkpoint(file=None, staging=None, part=None, publish=None, file_format=None,
+                       limit_bytes=error.limit_bytes, oversized_files=oversized,
                        previous_staging=previous_staging or state.get("previous_staging"))
             continue
 
-        if status == "no_source":
-            if state.get("quark_limited_format") == audio_format:
-                outcome["reason"] = f"夸克 {audio_format.upper()} 超过单文件上限（{state['limit_bytes']} 字节），且没有匹配的百度来源。"
-                outcome["stage"] = "download"
-                status = "failed"
-            if audio_format == "flac" and not options["flac_only"]:
-                checkpoint(format_fallback={"from": "flac", "to": "mp3", "reason": outcome["reason"]})
-                audio_format = "mp3"
-                continue
+        if status == "no_source" and (state.get("oversized_files") or state.get("quark_limited_format")):
+            return "failed", {"reason": f"夸克文件超过单文件上限（{state['limit_bytes']} 字节），且没有其他匹配来源。",
+                              "stage": "download"}
         return status, outcome
 
 
-def download_track(music, options, state, context, checkpoint, audio_format):
+def resume_format(options, state):
+    if state.get("file_format"):
+        return state["file_format"]
+    # 旧队列通过降级记录推断在途文件的格式。更早的队列只记录夸克上限。
+    legacy_fallback = state.get("limit_bytes") and not state.get("quark_limited_format")
+    if options["format"] == "flac" and (state.get("format_fallback") or legacy_fallback):
+        return "mp3"
+    return options["format"]
+
+
+def download_track(music, options, state, context, checkpoint):
     track = state.get("resolved") or state["track"]
+    audio_format = resume_format(options, state)
     context["stage"] = "lookup"
     part = Path(state["part"]) if state.get("part") else None
     result = None
@@ -585,13 +609,20 @@ def download_track(music, options, state, context, checkpoint, audio_format):
     if part is not None:
         part.unlink(missing_ok=True)
     if result is None:
-        if track["artist"] and not (state.get("selection") or state.get("staging")):
+        if track["artist"] and not (state.get("selection") or state.get("file") or state.get("staging")):
+            track = state["track"]
+            audio_format = options["format"]
             if existing := local_match(music, track, audio_format):
                 return "already_in_library", {"result": existing}
         if not state.get("file"):
-            status, outcome = choose_source(music, context, track, audio_format, state)
+            status, outcome = choose_source(music, context, state["track"], options, state)
             if status is not None:
                 return status, outcome
+            audio_format = outcome["file_format"]
+            outcome["format_fallback"] = None
+            if audio_format != options["format"]:
+                outcome["format_fallback"] = {"from": options["format"], "to": audio_format,
+                                               "reason": "按网盘和音质优先级选择可用来源。"}
             # 将录音信息与分享文件一起写入，恢复时按同一录音继续。
             checkpoint(**outcome)
             track = state["resolved"]

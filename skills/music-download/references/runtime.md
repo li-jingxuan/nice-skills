@@ -20,11 +20,16 @@
 ```bash
 python3 scripts/music_download.py lookup --title '成都' --artist '赵雷'
 python3 scripts/music_download.py reindex
+python3 scripts/music_download.py scan --directory '/music/华语'
 ```
 
 `lookup` 只需要可读的 `MUSIC_LIBRARY_ROOT` 和可写的 SQLite 存储。传基础歌名，省略 `--artist` 时会返回所有同名歌曲。查询按全角半角、大小写和空白归一化后的词精确匹配。`tracks` 包含 `artist`、`title`、`version`、`album`、`format`、`path` 和 `size`，其中未知的版本和专辑为 `null`。返回所有命中的音频格式和版本，供聊天流程判断是否符合要求。
 
-每个音乐库首次查询时建立索引，之后只查询数据库并验证命中文件仍存在且大小和修改时间一致。`reindex` 扫描所有子目录并返回 `indexed` 文件数。首次扫描及手动刷新识别 `歌手 - 歌名.格式`，支持从常见的括号或短横线后缀识别版本，例如 `赵雷 - 成都 (Live).flac`。扫描跳过隐藏文件、隐藏目录和符号链接。手动加入、移动或修改的文件在下次刷新后可查到，命名不规则的文件需要先调整文件名。刷新会保留未变化的技能入库文件已有的专辑和版本信息。
+每个音乐库首次查询时建立索引，之后只查询数据库并验证命中文件仍存在且大小和修改时间一致。`reindex` 扫描所有子目录并返回 `indexed` 文件数。全库扫描可识别新加入的 `歌手 - 歌名.格式`，例如 `赵雷 - 成都 (Live).flac`，也会保留未变化文件已有的元数据。全库刷新可清理已失效的索引记录。扫描跳过隐藏文件、隐藏子目录和符号链接。
+
+`scan` 递归导入指定目录。可用绝对路径或相对音乐库根目录的路径，例如 `--directory '华语'`。扫描新增或改动的文件时，优先用 `ffprobe` 读取歌名、歌手、专辑和版本。缺少 `ffprobe` 或标签时，用 `歌手 - 歌名` 或文件名补充可识别的字段。歌曲可通过同一个 SQLite 索引的 `lookup` 查询。
+
+同一音乐库内的同一绝对路径只对应一条索引记录。扫描重复路径时跳过未变化的文件，大小或修改时间变化时更新对应记录。不同路径的音频各自保留。命令返回 `directory`、`scanned`、`inserted`、`updated`、`unchanged` 和 `skipped`。`skipped` 记录扫描到但在提交前消失或变化的文件。指定目录扫描仅新增和更新记录，索引中的失效路径可用 `reindex` 清理。
 
 ### 下载
 
@@ -35,7 +40,7 @@ python3 scripts/music_download.py destination
 python3 scripts/music_download.py destination --directory '/music/华语'
 ```
 
-搜索支持 `--page`，响应的 `next_page` 有值时可继续查询。夸克和百度网盘标签的条目都会列入候选。详情结果中的 `downloads` 包含 `url` 和 `format`，格式未知时 `format` 为 `null`。
+搜索支持 `--page`，响应的 `next_page` 有值时可继续查询。可用 `--page-size 50` 每页返回最多 50 条候选。下歌吧单次请求最多返回 20 条，指定 `--page-size` 时脚本会按筛选后的候选合并多页，结果不足时返回剩余条目。继续翻页时使用相同关键词和页大小。夸克和百度网盘标签的条目都会列入候选。详情结果中的 `downloads` 包含 `url` 和 `format`，格式未知时 `format` 为 `null`。
 
 ```bash
 python3 scripts/music_download.py search --title '成都' --artist '赵雷'
@@ -45,9 +50,9 @@ python3 scripts/music_download.py share --url 'https://pan.quark.cn/s/example'
 
 `share` 输出可用的音频和目录。下一页用 `--page`。夸克子目录用 `--folder-fid`，百度子目录用 `--source-dir` 传目录条目的 `path`。链接有提取码时保留 URL 中的 `pwd`，或传 `--passcode`。`download` 沿用选中文件所在的链接、页码、子目录及提取码，复查 `--file-fid`。可传 `--version '现场版'`、`--album '专辑名'` 将确认过的信息写入索引。歌名已经带有版本后缀时沿用全名。如果歌名没有后缀且传了 `--version`，脚本会在文件名末尾附上版本。
 
-聊天流程先用正式发行信息和分享文件确认原唱及录音版本，再调用 `download`。默认顺序为夸克 FLAC → 百度 FLAC → 夸克 MP3 → 百度 MP3。批量在同一音质内按实际分享链接归类，跨下歌吧条目先核对夸克。切换到 MP3 时记录 `format_fallback`，`--flac-only` 只查两家的 FLAC。无法确认原唱或存在录音版本歧义时，用 `search`、`detail` 和 `share` 整理可用歌源，等待用户选定文件。
+单曲和批量的默认选源顺序是夸克 FLAC → 夸克 MP3 → 百度 FLAC → 百度 MP3。按实际分享链接和文件验证网盘与格式。歌名、歌手以及明确指定的专辑或版本匹配时可自动选源。切换到 MP3 时，批量结果记录 `format_fallback`。`--flac-only` 只查两家的 FLAC。无法核实歌手或指定版本时，用 `search`、`detail` 和 `share` 整理候选。
 
-`download` 默认使用 FLAC。可用 `--format mp3` 下载已确认的 MP3。若已查过同版本的百度 FLAC，且同一夸克分享页另有合适的 MP3，可显式传 `--mp3-file-fid`，供指定的夸克 FLAC 超限时回退。
+`download` 默认使用 FLAC。可用 `--format mp3` 下载已确认的 MP3。同一夸克分享页有匹配的 MP3 时，可显式传 `--mp3-file-fid`，供指定的夸克 FLAC 超限时回退。
 
 ```bash
 python3 scripts/music_download.py download \
@@ -69,7 +74,7 @@ python3 scripts/music_download.py download \
 
 `waiting_transfer` 表示暂存目录还未出现可核对的文件。保留响应中的 `baidu_staging`，稍后将其中的 `path` 作为 `--staging-dir` 加到原命令，继续核对原目录。原分享需要可访问，以复查选中文件的信息。若单曲返回 `error_code: busy` 和 `baidu_staging.submitted: false`，说明本次明确未提交，约五分钟后可用原命令重试。批量续跑会自动沿用已保存的音频信息、暂存目录和任务 ID。
 
-夸克返回 `download file size limit[52428800]` 这类单文件上限错误时，脚本给出 `error_code: download_size_limit` 和 `limit_bytes`，具体数值来自夸克响应。默认选源先切换到百度的相同音质，夸克上限仅用于夸克文件。显式传了同页的 `--mp3-file-fid` 时，脚本核对 MP3 格式及大小后自动转存和下载，并用 `fallback` 记录格式变更、上限和原暂存目录。切换到其他分享页或链接时，Skill 使用对应文件自己的分享参数。
+夸克返回 `download file size limit[52428800]` 这类单文件上限错误时，脚本给出 `error_code: download_size_limit` 和 `limit_bytes`，具体数值来自夸克响应。自动选源跳过超限的夸克文件，再按默认优先级核对剩余来源。显式传了同页的 `--mp3-file-fid` 时，单曲脚本核对 MP3 格式及大小后自动转存和下载，并用 `fallback` 记录格式变更、上限和原暂存目录。切换到其他分享页或链接时，使用对应文件自己的分享参数。
 
 脚本返回一行 JSON。入库成功时返回 `status`、`path`、`format` 和 `size`。同名且内容相同返回 `exists`，同名冲突返回 `error`。`saved` 和 `exists` 都会写入索引。若 NAS 文件已就绪但索引写入失败，结果保留成功状态并附上 `index_warning`。错误的 `stage` 标识失败环节。若已创建夸克暂存目录，响应附带 `quark_staging`。执行工具的超时应覆盖转存和下载，长任务可用后台模式等待结果。遇到超时或转存后尚未搜到文件时，先根据 `quark_staging` 检查远端状态，再决定是否重试。
 

@@ -8,8 +8,8 @@
 - 平台类别 `android | apple | other`，从 UA 提取的受限数字 App 版本或 `unknown`，不输出完整 UA。
 - 框架类别 `top | same-origin-frame | cross-origin-frame`。
 - 桥位置 `none | current | same-origin-parent`、就绪事件是否观察到、`_platformReady` 是否严格为 true。
-- 固定阶段、会话来源 `native | cookie | browser-storage`。
-- Cookie 状态 `missing | invalid | blocked | available`；`available` 仅指格式可用。
+- 固定阶段；仅在取得格式有效材料后填写会话来源 `native | cookie | browser-storage`，未取得时省略该字段，不猜测来源。
+- 仅在实际尝试读取 Cookie 后填写状态 `missing | invalid | blocked | available`；不适用、尚未尝试或没有宿主来源证据时省略该字段。`available` 仅指格式可用。
 - 下游固定操作名、HTTP 状态和已确认字段中的整数业务码；如需检查签名时效，可记录合法响应 Date 相对客户端的秒差。
 
 不包含原始返回、错误文本、用户标识、资源 ID、NAS 地址、文件路径、完整 URL、Cookie、secret、token、签名、凭据哈希或凭据片段。业务确需资源定位时，由业务自行评估单独的诊断字段；通用认证诊断不默认收集。
@@ -24,13 +24,15 @@
 - `FNS_NOT_READY`：桥存在但就绪条件未满足；检查早发事件、事件归属和延迟注入。不要直接删掉就绪检查。
 - `FNS_HANDLER_TIMEOUT`：调用已开始但未在时限内完成；停止后续请求，清理等待，忽略迟到结果。
 - `FNS_HANDLER_REJECTED`：同步抛错或 Promise 拒绝；显示固定说明，不输出原生错误文本，不触发 Cookie 兜底。
-- `FNS_NATIVE_EMPTY`：原生原始空值，Cookie 兼容未取得材料；附固定 Cookie 状态，不能靠猜字段名修复。
+- `FNS_NATIVE_EMPTY`：原生原始空值，Cookie 兼容未取得材料；尝试过读取时附固定 Cookie 状态，没有宿主来源证据而未尝试时省略，不得误记为 `missing`。不能靠猜字段名修复。
 - `FNS_RESPONSE_UNRECOGNIZED`：非空结果解析或字段校验失败；提供限长字段形状，不尝试旧存储或备用账号。
 - `FNS_WEB_STORAGE_BLOCKED`、`FNS_WEB_SECRET_MISSING`、`FNS_WEB_SESSION_INVALID`：分别提示网页宿主存储受限、未提供材料或格式无效。
 - `FNS_READY`：已取得格式有效材料；此阶段不表示服务器认证或业务 ACL 已通过。
-- 取消：按取消结果处理，不包装为登录失败，不触发自动重试。
+- 取消：按取消结果处理，不包装为登录失败，不触发自动重试。取消先于超时时保留取消结果，不要求增加会话失败阶段；超时先于取消时保留超时阶段。任何后到结果都不再触发业务请求。
 
 阶段名是兼容实现的诊断约定，非 fnOS 官方错误码。业务可采用不同名称，但需保持语义稳定。
+
+上述会话阶段仅用于实际会话获取；未知的下游失败尚不能填入具体操作阶段，官方应用 token 调用或仅文档提炼也不套用这些阶段。字段不适用或事实未确认时省略，不能虚构 `FNS_READY` 或具体失败点。
 
 ## 下游失败定位
 

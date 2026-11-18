@@ -28,6 +28,7 @@ from music_baidu import Baidu, BaiduError, FILE_ID as BAIDU_FILE_ID
 
 # 官网地址：https://so.liumingye.cn/
 API = "https://so.liumingye.cn/api/music"
+SEARCH_SOURCE_PAGE_SIZE = 20
 SHARE_PAGE_SIZE = 50
 DEFAULT_FORMAT = "flac"
 # 键是文件扩展名，值用于匹配 ffprobe 返回的容器名。Opus 音频通常封装在 Ogg 容器里。
@@ -177,12 +178,8 @@ def track_fields(track):
     return {key: track.get(key) for key in ("id", "title", "artist", "album", "version")}
 
 
-def search_tracks(args):
-    title = args.title.strip()
-    if not title:
-        raise SkillError("请提供歌名。")
-    query = f"{title} {args.artist.strip()}".rstrip()
-    data = source_json(f"{API}/search?" + urlencode({"q": query, "page": args.page, "pageSize": 25}))
+def search_page(query, page, page_size):
+    data = source_json(f"{API}/search?" + urlencode({"q": query, "page": page, "pageSize": page_size}))
     results = data.get("data")
     if not isinstance(results, list):
         raise SkillError("下歌吧的搜索结果缺少歌曲列表。")
@@ -195,8 +192,30 @@ def search_tracks(args):
             tracks.append({**track_fields(track), "quality": labels})
     return {
         "tracks": tracks,
-        "next_page": args.page + 1 if args.page < (data.get("totalPages") or 0) else None,
+        "next_page": page + 1 if page < (data.get("totalPages") or 0) else None,
     }
+
+
+def search_tracks(args):
+    title = args.title.strip()
+    if not title:
+        raise SkillError("请提供歌名。")
+    query = f"{title} {args.artist.strip()}".rstrip()
+    page_size = getattr(args, "page_size", None)
+    if page_size is None:
+        return search_page(query, args.page, 25)
+
+    # 按筛选后的候选分页。多读一条就能确认是否还有下一页。
+    skip = (args.page - 1) * page_size
+    tracks = []
+    page = 1
+    while page is not None and len(tracks) <= page_size:
+        result = search_page(query, page, SEARCH_SOURCE_PAGE_SIZE)
+        batch = result["tracks"]
+        tracks.extend(batch[skip:])
+        skip = max(0, skip - len(batch))
+        page = result["next_page"]
+    return {"tracks": tracks[:page_size], "next_page": args.page + 1 if len(tracks) > page_size else None}
 
 
 def track_detail(args):
@@ -401,11 +420,12 @@ def same_file_info(row, info):
     return stat.S_ISREG(info.st_mode) and info.st_size == row["size"] and info.st_mtime_ns == row["modified_ns"]
 
 
-def scan_library(root, previous):
+def scan_library(root, previous, *, directory=None):
     def fail(error):
         raise error
 
-    for folder, directories, files in os.walk(root, onerror=fail):
+    ffprobe = shutil.which("ffprobe")
+    for folder, directories, files in os.walk(directory or root, onerror=fail):
         directories[:] = [name for name in directories if not name.startswith(".")]
         for name in files:
             path = Path(folder) / name
@@ -427,8 +447,22 @@ def scan_library(root, previous):
                 yield dict(old)
                 continue
             artist, separator, title = path.stem.partition(" - ")
-            if separator and artist.strip() and title.strip():
-                yield track_record(root, path, info, artist, title, audio_format)
+            if not (separator and artist.strip() and title.strip()):
+                if directory is None and old is None:
+                    continue
+                artist, title = "", path.stem
+            tags = {}
+            if ffprobe and (directory is not None or old is not None):
+                try:
+                    _, _, tags = validate_audio(path, audio_format, info.st_size, ffprobe)
+                except (SkillError, OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
+                    # 损坏的标签或无法读取的容器仍可按文件名建立索引。
+                    pass
+            _, file_version = song_version(title)
+            tagged_title = tags.get("title") or title
+            _, version = song_version(tagged_title, tags.get("version"))
+            yield track_record(root, path, info, tags.get("artist") or artist, tagged_title,
+                               audio_format, version or file_version, tags.get("album"))
 
 
 def indexed(database, root):
@@ -449,6 +483,35 @@ def refresh_index(database, root, *, first_lookup=False):
         database.executemany(SAVE_TRACK, rows)
         database.execute("INSERT OR IGNORE INTO indexed_roots VALUES (?)", (str(root),))
     return len(rows)
+
+
+def scan_directory(database, root, directory):
+    # SQLite 按二进制排序时，'0' 紧跟 '/'。这个范围只包含指定目录的子路径。
+    prefix = str(directory).rstrip("/") + "/"
+    query = "SELECT * FROM library_tracks WHERE root = ? AND path >= ? AND path < ?"
+    values = (str(root), prefix, prefix[:-1] + "0")
+    previous = {row["path"]: row for row in database.execute(query, values)}
+    rows = list(scan_library(root, previous, directory=directory))
+    counts = {"inserted": 0, "updated": 0, "unchanged": 0}
+    with database:
+        # 读取标签时不持有写锁，提交时按最新索引判重，保留并发入库确认的元数据。
+        database.execute("BEGIN IMMEDIATE")
+        current = {row["path"]: row for row in database.execute(query, values)}
+        for row in rows:
+            path = Path(row["path"])
+            try:
+                info = path.lstat()
+                if path.resolve() != path or not same_file_info(row, info):
+                    continue
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            old = current.get(row["path"])
+            if old is not None and same_file_info(old, info):
+                counts["unchanged"] += 1
+                continue
+            database.execute(SAVE_TRACK, row)
+            counts["inserted" if old is None else "updated"] += 1
+    return {"directory": str(directory), "scanned": len(rows), **counts, "skipped": len(rows) - sum(counts.values())}
 
 
 def lookup_library(args):
@@ -989,10 +1052,13 @@ def parse_args():
     search.add_argument("--title", required=True)
     search.add_argument("--artist", default="")
     search.add_argument("--page", type=positive_int, default=1)
+    search.add_argument("--page-size", type=positive_int, help="每页返回的候选数，必要时合并下歌吧多页结果")
     lookup = commands.add_parser("lookup", help="查询 NAS 本地音乐索引")
     lookup.add_argument("--title", required=True)
     lookup.add_argument("--artist", default="")
     commands.add_parser("reindex", help="扫描整个 NAS 音乐库并刷新本地索引")
+    scan = commands.add_parser("scan", help="递归扫描指定音乐目录并更新 SQLite 索引")
+    scan.add_argument("--directory", required=True, help="已存在的库内目录，可用绝对路径或相对于音乐库根目录的路径")
     commands.add_parser("detail", help="查询歌曲的夸克和百度网盘分享链接").add_argument("--id", required=True)
     commands.add_parser("destination", help="检查入库目录配置").add_argument("--directory")
     share = commands.add_parser("share", help="浏览夸克或百度网盘分享文件")
@@ -1043,6 +1109,15 @@ def main():
             root = library_root()
             with closing(open_index()) as database:
                 result = {"indexed": refresh_index(database, root)}
+        elif args.command == "scan":
+            root = library_root()
+            if not args.directory:
+                raise SkillError("请指定音乐库内已存在的扫描目录。")
+            directory = destination_dir(args.directory)
+            if not directory.is_dir():
+                raise SkillError("请指定音乐库内已存在的扫描目录。")
+            with closing(open_index()) as database:
+                result = scan_directory(database, root, directory)
         elif args.command == "detail":
             result = track_detail(args)
         elif args.command == "lyrics":
