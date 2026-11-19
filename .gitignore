@@ -28,4 +28,5 @@ tmp/
 /skills/music-download/data/batches.sqlite3*
 /skills/kugou-playlist/data/
 .agent.md
+/AGENT.md
 /data
