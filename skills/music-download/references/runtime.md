@@ -5,6 +5,7 @@
 ## 运行配置
 
 - 搜索需要 Python 3.9+ 及访问 `https://so.liumingye.cn` 的网络。脚本使用 Python 标准库。
+- `MUSIC_SOURCE_REQUESTS_PER_MINUTE` 控制下歌吧搜索和详情的总请求速率，默认 10，须为正整数。默认每两次请求至少间隔 6 秒，重试也计入限额。使用同一缓存目录的单曲命令和批量进程共享请求间隔及冷却时间，请给这些进程使用同一速率配置。限流状态保存在 `$XDG_CACHE_HOME/nice-skills/music-download/source-rate.sqlite3`，未指定 `XDG_CACHE_HOME` 时用 `~/.cache`。
 - 转存和下载使用 Node.js 运行已配置的夸克网盘 Skill。`MUSIC_QUARK_CLI` 填 `quark-drive.cjs` 的绝对路径。夸克 CLI 1.0.11 和 1.0.25 会先检查当前运行环境。在 OpenCode 中直接运行时，实测返回 `-104`。请通过夸克可识别的实际运行环境调用，例如 OpenClaw 或 Codex。可先用 `resolve-agent` 检查环境，再通过夸克官方授权流程登录。脚本复用 CLI 的登录状态。
 - 百度分享使用官方 `bdpan`，从 `PATH` 查找，可以用 `MUSIC_BAIDU_CLI` 指定可执行文件。安装官方 `baidu-drive` Skill 后，按其登录流程给当前运行账号授权。CLI 需支持 `transfer list`、`transfer select` 和 `rm`，官方 Skill 1.7.7 对应 `bdpan` 3.8.9。每个百度任务使用 `/apps/bdpan/music-download-…` 下的独立暂存目录。 [官方安装与授权文档](https://github.com/baidu-netdisk/bdpan-storage)
 - `MUSIC_LIBRARY_ROOT` 指定已存在的音乐库根目录，例如 `/music`。`MUSIC_LIBRARY_DEFAULT_DIR` 可指定默认目录，例如 `/music/华语`。本次使用 `--directory` 可覆盖默认值。相对路径以音乐库根目录为基准，目标可以是根目录或其子目录。容器内应配置已挂载、可写且支持硬链接的目录。
@@ -41,6 +42,8 @@ python3 scripts/music_download.py destination --directory '/music/华语'
 ```
 
 搜索支持 `--page`，响应的 `next_page` 有值时可继续查询。可用 `--page-size 50` 每页返回最多 50 条候选。下歌吧单次请求最多返回 20 条，指定 `--page-size` 时脚本会按筛选后的候选合并多页，结果不足时返回剩余条目。继续翻页时使用相同关键词和页大小。夸克和百度网盘标签的条目都会列入候选。详情结果中的 `downloads` 包含 `url` 和 `format`，格式未知时 `format` 为 `null`。
+
+下歌吧返回 HTTP 429 时，同一请求最多额外重试 5 次。基础等待时间依次为 5、10、20、35、55 秒，实际请求还要遵守共享请求间隔和服务端 `Retry-After`，因此默认首次重试距离上一请求至少 6 秒。若仍受限，单曲返回 `error_code: source_rate_limited` 和 Unix 时间戳 `retry_at`。批量停止领取新曲目，已在途曲目完成当前处理后暂停，受限的曲目保留在队列中，之后可用原批次 ID 继续。
 
 ```bash
 python3 scripts/music_download.py search --title '成都' --artist '赵雷'

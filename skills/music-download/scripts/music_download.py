@@ -13,10 +13,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from contextlib import closing
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -28,6 +32,9 @@ from music_baidu import Baidu, BaiduError, FILE_ID as BAIDU_FILE_ID
 
 # 官网地址：https://so.liumingye.cn/
 API = "https://so.liumingye.cn/api/music"
+SOURCE_RATE_SETTING = "MUSIC_SOURCE_REQUESTS_PER_MINUTE"
+SOURCE_REQUESTS_PER_MINUTE = 10
+SOURCE_429_BACKOFF = (5, 10, 20, 35, 55)
 SEARCH_SOURCE_PAGE_SIZE = 20
 SHARE_PAGE_SIZE = 50
 DEFAULT_FORMAT = "flac"
@@ -131,6 +138,12 @@ class DownloadSizeLimit(SkillError):
         self.limit_bytes = limit_bytes
 
 
+class SourceRateLimited(SkillError):
+    def __init__(self, retry_at):
+        super().__init__(f"下歌吧返回 HTTP 429，重试 {len(SOURCE_429_BACKOFF)} 次后仍受限。")
+        self.retry_at = retry_at
+
+
 def require_id(value, label, *, pattern=QUARK_FID_PATTERN):
     # 夸克新版返回带签名的 FID。下歌吧调用传入单独的 ID 规则。
     if not isinstance(value, str) or not pattern.fullmatch(value):
@@ -158,14 +171,82 @@ def label_format(label):
     return next(iter(formats)) if len(formats) == 1 else None
 
 
+def retry_after_seconds(value):
+    value = (value or "").strip()
+    try:
+        if value.isdecimal():
+            return float(int(value))
+        if value:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0, date.timestamp() - time.time())
+    except (ValueError, TypeError, OverflowError, OSError):
+        pass
+    return 0
+
+
+def source_request_interval():
+    try:
+        limit = int(os.environ.get(SOURCE_RATE_SETTING, SOURCE_REQUESTS_PER_MINUTE))
+        if limit > 0:
+            return 60 / limit
+    except (ValueError, OverflowError):
+        pass
+    raise SkillError(f"{SOURCE_RATE_SETTING} 必须为正整数。", required_setting=SOURCE_RATE_SETTING)
+
+
+def open_source_rate_db():
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    path = cache / "nice-skills" / "music-download" / "source-rate.sqlite3"
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return sqlite3.connect(path, timeout=30)
+
+
+def wait_for_source_request(database, interval):
+    while True:
+        with database:
+            # CLI 和批量线程共用请求间隔。只在取得当前请求名额时更新，等待期间释放数据库锁。
+            database.execute("BEGIN IMMEDIATE")
+            next_request, = database.execute("SELECT next_request FROM source_rate WHERE id = 1").fetchone()
+            now = time.time()
+            if next_request <= now:
+                database.execute("UPDATE source_rate SET next_request = ? WHERE id = 1", (now + interval,))
+                return
+        time.sleep(min(60, next_request - now))
+
+
 def source_json(url):
     request = Request(url, headers={
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     })
-    with urlopen(request, timeout=20) as response:
-        raw = response.read()
+    interval = source_request_interval()
+    with closing(open_source_rate_db()) as database:
+        with database:
+            database.execute("CREATE TABLE IF NOT EXISTS source_rate (id INTEGER PRIMARY KEY, next_request REAL NOT NULL)")
+            database.execute("INSERT OR IGNORE INTO source_rate VALUES (1, 0)")
+        # 最后一次仍受限时，也为其他进程和下次续跑保留冷却时间。
+        for attempt, delay in enumerate((*SOURCE_429_BACKOFF, SOURCE_429_BACKOFF[-1])):
+            wait_for_source_request(database, interval)
+            try:
+                with urlopen(request, timeout=20) as response:
+                    raw = response.read()
+            except HTTPError as error:
+                if error.code != 429:
+                    raise
+                with error:
+                    retry_after = retry_after_seconds((error.headers or {}).get("Retry-After"))
+                retry_at = time.time() + max(retry_after, delay)
+                with database:
+                    database.execute("UPDATE source_rate SET next_request = MAX(next_request, ?) WHERE id = 1", (retry_at,))
+                    if attempt == len(SOURCE_429_BACKOFF):
+                        retry_at, = database.execute("SELECT next_request FROM source_rate WHERE id = 1").fetchone()
+                if attempt == len(SOURCE_429_BACKOFF):
+                    raise SourceRateLimited(retry_at) from None
+            else:
+                break
     if raw[:2] == b"\x1f\x8b":
         import gzip
         raw = gzip.decompress(raw)
@@ -1154,6 +1235,8 @@ def main():
             context["required_setting"] = error.required_setting
         if isinstance(error, DownloadSizeLimit):
             context.update(error_code="download_size_limit", limit_bytes=error.limit_bytes)
+        if isinstance(error, SourceRateLimited):
+            context.update(error_code="source_rate_limited", http_status=429, retry_at=error.retry_at)
         message = "等待外部命令超时，请检查当前步骤的结果。" if isinstance(error, subprocess.TimeoutExpired) else str(error)
         print(json.dumps({"status": "error", **context, "message": message}, ensure_ascii=False))
         return 1

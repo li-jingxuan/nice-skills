@@ -16,7 +16,6 @@ import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing, contextmanager
-from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from pathlib import Path
 from uuid import uuid4
@@ -504,8 +503,8 @@ def source_order(options):
 
 def choose_source(music, context, track, options, state):
     """返回可写入的选源恢复点，或结束当前曲目的状态和原因。"""
-    context["stage"] = "search"
     selection = state.get("selection")
+    context["stage"] = "detail" if selection else "search"
     limit = state.get("limit_bytes")
     choices = resolve_track(music, track, selection)
     if not choices:
@@ -540,6 +539,8 @@ def choose_source(music, context, track, options, state):
         context["stage"] = "detail"
         try:
             detail = item if "downloads" in item else music.track_detail(argparse.Namespace(id=item["id"]))
+        except music.SourceRateLimited:
+            raise
         except (music.SkillError, OSError, HTTPException, ValueError) as error:
             # 排查另一个条目失败时，仍可使用已经确认的分享。
             source_errors.append((error, context.copy(), item, None))
@@ -730,6 +731,9 @@ def run_item(path, job, position, state, options, music):
         cooldown_until = 0
         try:
             status, outcome = process_track(music, options, state, context, checkpoint)
+        except music.SourceRateLimited as error:
+            # 请求层已重试五次。保留曲目供下次续跑，避免队列再次循环重试同一个请求。
+            status, outcome = "paused", {"reason": str(error), "stage": context["stage"]}
         except (music.SkillError, OSError, HTTPException, ValueError, TypeError, KeyError, AttributeError,
                 subprocess.TimeoutExpired, sqlite3.Error) as error:
             stage = context["stage"]
@@ -739,6 +743,7 @@ def run_item(path, job, position, state, options, music):
             kind = error.kind if isinstance(error, music.BaiduError) else None
             shared_failure = (quark_code in (-103, -104, 32003, 41035, 41014) or "未登录" in message or "未授权" in message
                               or kind in {"auth", "configuration"}
+                              or getattr(error, "required_setting", None) == music.SOURCE_RATE_SETTING
                               or isinstance(error, sqlite3.Error) or stage == "configuration"
                               or (isinstance(error, OSError) and error.errno in
                                   {errno.ENOSPC, errno.EROFS, errno.EACCES, errno.EPERM}))
@@ -760,15 +765,9 @@ def run_item(path, job, position, state, options, music):
                 errors.append({"attempt": len(errors) + 1, "stage": stage, "message": message, "time": time.time()})
                 status = "retrying" if len(errors) <= MAX_RETRIES else "failed"
                 delay = 2 ** min(len(errors), MAX_RETRIES)
-                retry_after = (getattr(error, "headers", None) or {}).get("Retry-After", "")
-                if limited and retry_after:
-                    try:
-                        # HTTP Retry-After 可以是秒数或绝对日期。至少保留本地退避时长。
-                        server_delay = (int(retry_after) if retry_after.isdecimal()
-                                        else parsedate_to_datetime(retry_after).timestamp() - time.time())
-                        delay = max(delay, server_delay)
-                    except (ValueError, OverflowError):
-                        pass
+                if limited:
+                    retry_after = (getattr(error, "headers", None) or {}).get("Retry-After")
+                    delay = max(delay, music.retry_after_seconds(retry_after))
                 deadline = time.time() + delay
                 if status == "retrying":
                     retry_at = deadline

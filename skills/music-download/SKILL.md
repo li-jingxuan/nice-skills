@@ -36,6 +36,8 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]}}}
 5. `download` 返回 `saved` 或 `exists` 后，回复歌手、歌名、实际格式、最终路径和歌词结果。`index_warning` 表示文件已入库，索引待刷新。失败时报告环节并保留已有暂存信息。链接需要提取码时向用户索取。授权失败时通过对应网盘的官方流程恢复授权，百度使用官方 `baidu-drive` Skill。百度返回 `waiting_transfer` 时说明转存结果待核对，保留 `baidu_staging.path` 和已有的 `task_id`，稍后使用 `--staging-dir` 续接。
 6. 音频校验并保存到 NAS 后，脚本自动删除此次百度网盘的暂存音频。`staging_cleanup.status` 为 `removed` 表示该副本已清理。若为 `manual` 或 `warning`，告知用户暂存位置和原因。夸克官方 CLI 暂无删除命令，可在夸克客户端将对应副本移入回收站。
 
+下歌吧搜索与详情默认共用每分钟 10 次的请求上限。HTTP 429 会自动等待后重试最多 5 次。若返回 `source_rate_limited` 或批次因此暂停，报告限流并保留任务，稍后沿用原请求或原批次 ID 继续。
+
 ## FLAC 超过下载上限
 
 - 夸克 FLAC 返回 `error_code: download_size_limit` 时，跳过超限文件并继续查符合条件的夸克 FLAC。夸克没有可用 FLAC 且允许使用 MP3 时，依次查夸克 MP3、百度 FLAC、百度 MP3。夸克的字节上限只用于筛选夸克文件。
