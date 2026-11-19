@@ -50,7 +50,13 @@ python3 scripts/music_download.py share --url 'https://pan.quark.cn/s/example'
 
 `share` 输出可用的音频和目录。下一页用 `--page`。夸克子目录用 `--folder-fid`，百度子目录用 `--source-dir` 传目录条目的 `path`。链接有提取码时保留 URL 中的 `pwd`，或传 `--passcode`。`download` 沿用选中文件所在的链接、页码、子目录及提取码，复查 `--file-fid`。可传 `--version '现场版'`、`--album '专辑名'` 将确认过的信息写入索引。歌名已经带有版本后缀时沿用全名。如果歌名没有后缀且传了 `--version`，脚本会在文件名末尾附上版本。
 
-单曲和批量的默认选源顺序是夸克 FLAC → 夸克 MP3 → 百度 FLAC → 百度 MP3。按实际分享链接和文件验证网盘与格式。歌名、歌手以及明确指定的专辑或版本匹配时可自动选源。切换到 MP3 时，批量结果记录 `format_fallback`。`--flac-only` 只查两家的 FLAC。无法核实歌手或指定版本时，用 `search`、`detail` 和 `share` 整理候选。
+单曲和批量的默认选源顺序是夸克 FLAC → 夸克 MP3 → 百度 FLAC → 百度 MP3。按实际分享链接和文件验证网盘与格式。匹配完整歌名和歌手署名即可自动选择。多个合格音源可直接按优先级处理。同一档优先歌名和歌手完全匹配的条目。合唱字段包含指定歌手时可匹配，明确指定的专辑和版本需符合要求。切换到 MP3 时，批量结果记录 `format_fallback`。`--flac-only` 只查两家的 FLAC。无法核实歌手或指定版本时，用 `search`、`detail` 和 `share` 整理候选。
+
+```bash
+python3 scripts/music_download.py resolve-source --title '成都' --artist '赵雷'
+```
+
+`resolve-source` 只查库和选源。`selected` 返回 `file`、`file_format` 和 `resolved`，可直接交给 `download`。也可能返回 `already_in_library`、`needs_review` 或 `no_source`。可通过 `--album`、`--version` 和 `--format` 按用户要求筛选，显式传 `--format flac` 时只选 FLAC。
 
 `download` 默认使用 FLAC。可用 `--format mp3` 下载已确认的 MP3。同一夸克分享页有匹配的 MP3 时，可显式传 `--mp3-file-fid`，供指定的夸克 FLAC 超限时回退。
 
@@ -100,7 +106,7 @@ python3 scripts/music_download.py lyrics --path '/music/华语/赵雷 - 少女.f
 
 ### 批量下载与续跑
 
-`batch-add` 接收 UTF-8 文本、JSON 曲目数组和 `kugou-playlist` 导出的版本 1 JSON 清单。文本每行使用 `歌名` 或 `歌手 - 歌名`。手填 JSON 数组的每项可以是歌名字符串，或使用 `{"title":"成都","artist":"赵雷","album":"无法长大","version":null}`。`title` 必填，`artist`、`album`、`version` 可省略或填 `null`。目录和音质沿用单曲参数，`--flac-only` 禁止切换到 MP3。
+`batch-add` 接收 UTF-8 文本、JSON 曲目数组和 `kugou-playlist` 导出的版本 1 JSON 清单。文本每行使用 `歌名` 或 `歌手 - 歌名`。手填 JSON 数组的每项可以是歌名字符串，或使用 `{"title":"成都","artist":"赵雷","album":"无法长大","version":null}`。`title` 必填，`artist`、`album`、`version` 可省略或填 `null`。目录和音质沿用单曲参数。`--format flac` 和 `--flac-only` 都将新批次限制为 FLAC。
 
 将酷狗 `tracks --for-download` 返回的临时清单路径传给 `--consume-manifest`。批量入口检查 `schema_version: 1`、`source: "kugou"`、`read_status` 及曲目计数，按 `tracks` 原顺序读取匹配字段。`read_status: partial` 时先确认是否处理已读取曲目，再加 `--allow-partial`。缺少歌名时会报告位置，补齐后即可重新导入。
 
@@ -119,6 +125,6 @@ python3 scripts/music_download.py batch-select --job '<批次 ID>' --item 3 --tr
 
 状态保存在音乐库索引旁的 `batches.sqlite3`，可通过 `MUSIC_BATCH_DB` 指向运行主机上的持久化可写文件。一次只运行该数据库中的一个批次，可在运行期间查询状态。`--workers` 有效范围是 1 到 10，默认 10。普通单曲错误最多额外重试 5 次，逐次退避。明确限流时暂停派发新任务，按服务端 `Retry-After` 或退避时间等待，并调低当次运行的并发数。明确超限且无法回退时记录失败，无匹配音源时记录 `no_source`。授权、转存额度、存储或索引等共用故障令批次暂停，恢复后用原批次 ID 继续。
 
-`batch-status` 返回统计和逐曲记录，`--state` 可筛选状态，`--offset`、`--limit` 可翻页。只给歌名时，批次先用网易云和 QQ 音乐的正式专辑条目交叉核对演唱者，再匹配下歌吧条目。无法核实时记为 `needs_review`，其他曲目会继续处理，批次结束时集中查看这些记录。待确认达到 10 首时批次提前暂停。用户确认继续后，恢复命令加 `--continue-review`，本次会处理剩余队列，待确认项仍保留。可按 `position` 用 `batch-select` 选择已经确认的下歌吧条目。选择具体文件时加 `--url`、`--file-fid`、`--page` 和对应子目录参数，必要时传 `--passcode`。选定后仍用原批次 ID 运行。
+`batch-status` 返回统计和逐曲记录，`--state` 可筛选状态，`--offset`、`--limit` 可翻页。只给歌名时，批次先用网易云和 QQ 音乐的正式专辑条目交叉核对演唱者，再匹配下歌吧条目。无法核实时记为 `needs_review`，其他曲目会继续处理，批次结束时集中查看这些记录。更新匹配规则后，旧批次内已提供歌手且尚未选源的待确认曲目会在下次运行时重新匹配。待确认达到 10 首时批次提前暂停。用户确认继续后，恢复命令加 `--continue-review`，本次会处理剩余队列，待确认项仍保留。可按 `position` 用 `batch-select` 选择已经确认的下歌吧条目。选择具体文件时加 `--url`、`--file-fid`、`--page` 和对应子目录参数，必要时传 `--passcode`。选定后仍用原批次 ID 运行。
 
 续跑沿用已选文件和网盘暂存位置。百度转存结果未知时记为 `waiting_transfer`，保留暂存目录及 CLI 已返回的 `task_id`，下次运行原批次时复查目录。服务端报告有其他任务正在转存时，五分钟后才重新领取该曲。等待状态允许其他曲目继续，也保留单曲的下载重试次数。下载中断时从可验证的阶段继续。已经完成校验并记录待发布哈希的文件可恢复发布或补写索引。续跑时会复查已完成的音频路径和大小，将缺失或大小变化的记录排回队列。`failed` 保留错误阶段和历次失败信息，`no_source` 保留未找到可用来源的原因。LRC 查询结果记在逐曲结果中。

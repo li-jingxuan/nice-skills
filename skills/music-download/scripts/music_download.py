@@ -40,7 +40,8 @@ CODEC_MATCH_FORMATS = {"flac", "mp3", "aac", "ape", "opus"}
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 QUARK_FID_PATTERN = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_-]*|~[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+)")
 QUARK_DOWNLOAD_LIMIT = re.compile(r"\bdownload file size limit\s*\[\s*([1-9][0-9]{0,19})\s*\]", re.IGNORECASE)
-VERSION_SUFFIX = re.compile(r"(?:\s*[(（\[【]([^()（）\[\]【】]+)[)）\]】]| - ([^-]+))$")
+VERSION_SUFFIX = re.compile(r" - ([^-]+)$")
+BRACKETED_VERSION_SUFFIX = re.compile(r"\s*[(（\[【]([^()（）\[\]【】]+)[)）\]】]$")
 VERSION_LABEL = re.compile(
     r"\b(live|acoustic|instrumental|remaster(?:ed)?|remix|demo|cover|radio edit)\b"
     r"|现场|演唱会|不插电|伴奏|重制|重录|混音|翻唱|录音室|原版", re.IGNORECASE,
@@ -379,9 +380,9 @@ def song_key(text):
 def song_version(title, version=None):
     title = title.strip()
     version = (version or "").strip() or None
-    match = VERSION_SUFFIX.search(title)
+    match = BRACKETED_VERSION_SUFFIX.search(title) or VERSION_SUFFIX.search(title)
     if match:
-        label = (match[1] or match[2]).strip()
+        label = match[1].strip()
         base = title[:match.start()].strip()
         if base and (VERSION_LABEL.search(label) or (version and song_key(label) == song_key(version))):
             return base, version or label
@@ -1053,6 +1054,12 @@ def parse_args():
     search.add_argument("--artist", default="")
     search.add_argument("--page", type=positive_int, default=1)
     search.add_argument("--page-size", type=positive_int, help="每页返回的候选数，必要时合并下歌吧多页结果")
+    resolve = commands.add_parser("resolve-source", help="按歌名和歌手自动选择可下载音源")
+    resolve.add_argument("--title", required=True)
+    resolve.add_argument("--artist", default="")
+    resolve.add_argument("--album", default="")
+    resolve.add_argument("--version")
+    resolve.add_argument("--format", choices=FORMATS, type=str.lower, help="仅匹配指定的音频格式")
     lookup = commands.add_parser("lookup", help="查询 NAS 本地音乐索引")
     lookup.add_argument("--title", required=True)
     lookup.add_argument("--artist", default="")
@@ -1103,6 +1110,8 @@ def main():
     try:
         if args.command == "search":
             result = search_tracks(args)
+        elif args.command == "resolve-source":
+            result = music_batch.resolve_source(args, sys.modules[__name__], context)
         elif args.command == "lookup":
             result = lookup_library(args)
         elif args.command == "reindex":

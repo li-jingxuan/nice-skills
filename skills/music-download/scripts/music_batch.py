@@ -25,9 +25,13 @@ from uuid import uuid4
 MAX_WORKERS = 10
 MAX_RETRIES = 5
 NEEDS_REVIEW_LIMIT = 10
-BATCH_MATCHER_VERSION = 4
+BATCH_MATCHER_VERSION = 5
 PLAYLIST_SCHEMA_VERSION = 1
-OTHER_VERSION = re.compile(r"\b(?:dj|remix|cover|live|instrumental)\b|翻唱|现场|現場|伴奏|混音|重混|加速|纯享", re.IGNORECASE)
+OTHER_VERSION = re.compile(r"(?<![a-z0-9])(?:dj|remix|cover|live|instrumental)(?![a-z0-9])"
+                           r"|翻唱|现场|現場|伴奏|混音|重混|加速|纯享", re.IGNORECASE)
+CREDIT_SEPARATOR = re.compile(r"[/;、,&+，]|(?:\s*\(|\s+)(?:feat\.?|ft\.?|with|x|×)\s+", re.IGNORECASE)
+FILE_QUALITY_SUFFIX = re.compile(r"\s*[\[(](?:flac|mp3|hi-?res|无损|高音质|\d+\s*kbps)[\])]$", re.IGNORECASE)
+STUDIO_VERSIONS = {"原版", "录音室", "录音室版", "original", "original version", "studio version", "album version"}
 STATES = ("queued", "running", "retrying", "waiting_transfer", "saved", "already_in_library", "duplicate", "needs_review",
           "no_source", "failed")
 SCHEMA = """
@@ -54,7 +58,7 @@ def add_commands(commands, formats, default_format):
     inputs.add_argument("--consume-manifest", type=Path, help="导入酷狗临时清单，批次提交后清理文件")
     add.add_argument("--allow-partial", action="store_true", help="确认导入部分读取的歌单")
     add.add_argument("--directory")
-    add.add_argument("--format", choices=formats, type=str.lower, default=default_format)
+    add.add_argument("--format", choices=formats, type=str.lower, help=f"仅匹配指定格式，默认优先 {default_format.upper()}")
     add.add_argument("--flac-only", action="store_true", help="FLAC 超限时保留无损要求")
     run = commands.add_parser("batch-run", help="开始或恢复批量下载")
     run.add_argument("--workers", type=lambda value: bounded_int(value, MAX_WORKERS), default=MAX_WORKERS)
@@ -174,7 +178,8 @@ def load_input(path, music, *, allow_partial=False, require_playlist=False):
 
 
 def add_job(db, args, music):
-    if args.flac_only and args.format != "flac":
+    audio_format = args.format or music.DEFAULT_FORMAT
+    if args.flac_only and audio_format != "flac":
         raise ValueError("--flac-only 需与 FLAC 格式一起使用。")
     target = music.destination_dir(args.directory)
     handoff = args.consume_manifest
@@ -186,8 +191,8 @@ def add_job(db, args, music):
             raise ValueError("临时清单路径须指向文件本身。")
     job = handoff.stem if handoff is not None else uuid4().hex
     input_path = handoff if handoff is not None else args.input
-    options = {"root": str(music.library_root()), "directory": str(target), "format": args.format,
-               "flac_only": args.flac_only, "matcher_version": BATCH_MATCHER_VERSION}
+    options = {"root": str(music.library_root()), "directory": str(target), "format": audio_format,
+               "flac_only": args.flac_only or args.format == "flac", "matcher_version": BATCH_MATCHER_VERSION}
     seen = {}
     # 清单解析和写入共用一个事务。后半段有无效条目时，前半段也会回滚。
     # 重复曲目仍保留原编号，方便按用户提供的清单核对结果。
@@ -198,7 +203,9 @@ def add_job(db, args, music):
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute("SELECT options FROM jobs WHERE id = ?", (job,)).fetchone()
         if prior is not None:
-            if json.loads(prior[0]) != options:
+            prior_options = json.loads(prior[0])
+            prior_options["matcher_version"] = BATCH_MATCHER_VERSION
+            if prior_options != options:
                 raise ValueError(f"该清单已创建批次 {job}，请沿用原目录和格式参数。")
         else:
             db.execute("INSERT INTO jobs VALUES (?, ?)", (job, dumps(options)))
@@ -301,7 +308,7 @@ def resolve_track(music, track, selection):
         item = music.track_detail(argparse.Namespace(id=selection["track_id"]))
         title, version = music.lyric_song_version(item["title"], track["version"])
         version = item.get("version") or version or ""
-        if title_key(music, title) != title_key(music, track["title"]) or not item.get("artist"):
+        if not matching_title(music, title, track["title"], version) or not item.get("artist"):
             raise ValueError("选中的条目与歌名不符，或缺少歌手。")
         return [(item, version)]
     page = 1
@@ -309,25 +316,62 @@ def resolve_track(music, track, selection):
     while page is not None and page <= 10:
         result = music.search_tracks(argparse.Namespace(title=track["title"], artist=track["artist"], page=page))
         for item in result["tracks"]:
-            title, version = music.lyric_song_version(item["title"] or "", track["version"])
-            version = item.get("version") or version or ""
-            if title_key(music, title) != title_key(music, track["title"]) or not item.get("artist"):
+            label = item.get("version") or ""
+            title, version = music.lyric_song_version(item["title"] or "", label or track["version"])
+            if not matching_title(music, title, track["title"], version) or not item.get("artist"):
                 continue
-            if track["artist"] and music.artist_key(item["artist"]) != music.artist_key(track["artist"]):
+            if track["artist"] and not matching_artist(music, item["artist"], track["artist"]):
                 continue
-            if music.song_key(version) != music.song_key(track["version"]):
+            if (not matching_version(music, label or version, track["version"])
+                    or (version and not matching_version(music, version, track["version"]))):
                 continue
             if not track["version"] and OTHER_VERSION.search(item.get("album") or ""):
                 continue
             if track["album"] and item.get("album") and music.song_key(item["album"]) != music.song_key(track["album"]):
                 continue
-            choices[item["id"]] = (item, version)
+            choices[item["id"]] = (item, track["version"])
         page = result["next_page"]
     return list(choices.values())
 
 
 def title_key(music, title):
     return re.sub(r" +(?=\()", "", music.song_key(title))
+
+
+def matching_title(music, candidate, title, version=""):
+    key = title_key(music, candidate)
+    wanted = title_key(music, title)
+    if not wanted:
+        return False
+    if key == wanted:
+        return True
+    for match in title_occurrences(key, wanted):
+        qualifier = f"{key[:match.start()]} {key[match.end():]}"
+        if version or not OTHER_VERSION.search(qualifier):
+            return True
+    return False
+
+
+def title_occurrences(key, title):
+    return re.finditer(rf"(?<![^\W_]){re.escape(title)}(?![^\W_])", key)
+
+
+def matching_artist(music, candidate, expected):
+    candidate = music.song_key(candidate)
+    expected = music.song_key(expected)
+    if candidate == expected:
+        return True
+    credits = {part.strip(" )") for part in CREDIT_SEPARATOR.split(candidate) if part.strip(" )")}
+    if expected in credits:
+        return True
+    requested = {part.strip(" )") for part in CREDIT_SEPARATOR.split(expected) if part.strip(" )")}
+    return bool(requested) and requested <= credits
+
+
+def matching_version(music, candidate, expected):
+    candidate = music.song_key(candidate or "")
+    expected = music.song_key(expected or "")
+    return candidate == expected or (not expected and candidate in STUDIO_VERSIONS)
 
 
 def confirmed_release(music, track):
@@ -351,18 +395,28 @@ def confirmed_release(music, track):
 def file_title(music, filename, track):
     stem = Path(filename).stem.strip()
     stem = re.sub(r"^\d+[ ._、-]+", "", stem)
+    stem = FILE_QUALITY_SUFFIX.sub("", music.song_key(stem))
     return music.lyric_song_version(stem, track["version"])
 
 
 def matching_filename(music, filename, track):
     base, version = file_title(music, filename, track)
-    if version and music.song_key(version) != music.song_key(track["version"]):
+    if version and not matching_version(music, version, track["version"]):
         return False
     key = title_key(music, base)
-    aliases = [track["title"]]
+    title = title_key(music, track["title"])
+    if key == title:
+        return True
     for divider in (" - ", "-", " – ", " — ", "—"):
-        aliases.extend((track["artist"] + divider + track["title"], track["title"] + divider + track["artist"]))
-    return key in {title_key(music, alias) for alias in aliases}
+        if key in {title_key(music, track["artist"] + divider + track["title"]),
+                   title_key(music, track["title"] + divider + track["artist"])}:
+            return True
+    for match in title_occurrences(key, title):
+        # 只接受完整歌名及可辨认的歌手署名，避免同一分享里的同名翻唱或相似歌名。
+        credit = f"{key[:match.start()]} {key[match.end():]}".strip(" -–—_:《》〈〉[]()·.")
+        if matching_artist(music, credit, track["artist"]) and (version or not OTHER_VERSION.search(credit)):
+            return True
+    return False
 
 
 def find_file(music, context, track, audio_format, url, limit):
@@ -490,14 +544,15 @@ def choose_source(music, context, track, options, state):
             # 排查另一个条目失败时，仍可使用已经确认的分享。
             source_errors.append((error, context.copy(), item, None))
             continue
-        detail_title, detail_version = music.lyric_song_version(detail["title"], version)
+        detail_label = detail.get("version") or ""
+        detail_title, detail_version = music.lyric_song_version(detail["title"] or "", detail_label or version)
         album = detail.get("album") or ""
-        version_key = music.song_key(version)
+        expected_artist = item["artist"] if selection else track["artist"]
         # 专辑只在请求明确指定时限制选源。歌名、歌手和已标注的版本仍需一致。
-        if (title_key(music, detail_title) != title_key(music, resolved["title"])
-                or music.artist_key(detail["artist"] or "") != music.artist_key(resolved["artist"])
-                or music.song_key(detail.get("version") or detail_version or "") != version_key
-                or (detail_version and music.song_key(detail_version) != version_key)
+        if (not matching_title(music, detail_title, resolved["title"], version)
+                or not detail["artist"] or not matching_artist(music, detail["artist"], expected_artist)
+                or (detail_label and not matching_version(music, detail_label, version))
+                or (detail_version and not matching_version(music, detail_version, version))
                 or (not selection and not version and OTHER_VERSION.search(album))
                 or (not selection and track["album"] and music.song_key(album or item.get("album") or "")
                     != music.song_key(track["album"]))):
@@ -505,12 +560,15 @@ def choose_source(music, context, track, options, state):
                 detail_conflict = [music.track_fields(item), music.track_fields(detail)]
             continue
         resolved["album"] = album or resolved["album"]
+        resolved["artist"] = detail["artist"]
         recordings.append(resolved)
+        rank = (title_key(music, detail_title) != title_key(music, resolved["title"]),
+                music.song_key(detail["artist"]) != music.song_key(expected_artist))
         for url, file_format in dict.fromkeys((entry["url"], entry["format"]) for entry in detail["downloads"]):
             provider = music.share_provider(url)
             for pair, candidates in sources.items():
                 if pair[0] == provider and file_format in (None, pair[1]):
-                    candidates.append((url, resolved, item))
+                    candidates.append((url, resolved, item, rank))
 
     incomplete = None
     checked_library = set()
@@ -520,20 +578,21 @@ def choose_source(music, context, track, options, state):
             checked_library.add(audio_format)
             context["stage"] = "lookup"
             for resolved in recordings:
-                if existing := local_match(music, resolved, audio_format):
+                if existing := local_match(music, {**resolved, "album": track["album"]}, audio_format):
                     return "already_in_library", {"result": existing}
         if provider == "quark" and audio_format == state.get("quark_limited_format"):
             continue
         checked = set()
-        for url, resolved, item in candidates:
-            link = (url, resolved["artist"], resolved["version"])
+        for url, resolved, item, _ in sorted(candidates, key=lambda entry: entry[3]):
+            file_track = resolved if selection else {**resolved, "artist": track["artist"]}
+            link = (url, file_track["artist"], file_track["version"])
             if link in checked:
                 continue
             checked.add(link)
             # 一个分享失效、缺提取码或网盘尚未配置时，仍可尝试同录音同格式的其他链接。
             attempt = context.copy()
             try:
-                selected_file, ambiguous = find_file(music, attempt, resolved, audio_format, url, limit)
+                selected_file, ambiguous = find_file(music, attempt, file_track, audio_format, url, limit)
             except (music.SkillError, music.BaiduError, subprocess.TimeoutExpired) as error:
                 if getattr(error, "kind", None) != "expired":
                     source_errors.append((error, attempt, item, url))
@@ -557,6 +616,20 @@ def choose_source(music, context, track, options, state):
         raise error
     formats = "、".join(dict.fromkeys(audio_format.upper() for _, audio_format in sources))
     return "no_source", {"reason": f"没有找到与歌名、歌手及指定版本匹配的 {formats} 文件。"}
+
+
+def resolve_source(args, music, context):
+    title, version = music.song_version(args.title, args.version)
+    if not title:
+        raise music.SkillError("请提供歌名。")
+    track = {"title": title, "artist": args.artist.strip(), "version": version or "", "album": args.album.strip()}
+    options = {"format": args.format or music.DEFAULT_FORMAT, "flac_only": args.format == "flac"}
+    if track["artist"]:
+        context["stage"] = "lookup"
+        if existing := local_match(music, track, options["format"]):
+            return {"status": "already_in_library", "result": existing}
+    status, outcome = choose_source(music, context, track, options, {})
+    return {"status": status or "selected", **outcome}
 
 
 def process_track(music, options, state, context, checkpoint):
@@ -753,13 +826,18 @@ def run_job(path, db, args, music):
         if str(music.destination_dir(options["directory"])) != options["directory"]:
             raise ValueError("批次保存目录已改变，请恢复原路径。")
         if options.get("matcher_version") != BATCH_MATCHER_VERSION:
-            # 重新核对旧批次的无音源条目，曾因夸克超限跳过的百度 FLAC 也可重新检查。
+            # 用新规则重新核对旧批次无音源项及已提供歌手的待确认项。
             options["matcher_version"] = BATCH_MATCHER_VERSION
             with db:
                 db.execute("UPDATE jobs SET options = ? WHERE id = ?", (dumps(options), job))
-                for position, raw in db.execute("SELECT position, details FROM items WHERE job = ? AND status = 'no_source'",
-                                                (job,)).fetchall():
+                for position, status, raw in db.execute(
+                    "SELECT position, status, details FROM items WHERE job = ? AND status IN ('no_source', 'needs_review')",
+                    (job,),
+                ).fetchall():
                     state = json.loads(raw)
+                    if status == "needs_review" and (not state["track"]["artist"] or state.get("selection")
+                                                     or state.get("file") or state.get("staging")):
+                        continue
                     state.pop("format_fallback", None)
                     if options["format"] == "flac" and state.get("limit_bytes") and not state.get("quark_limited_format"):
                         state["quark_limited_format"] = "flac"
